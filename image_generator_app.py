@@ -5,7 +5,7 @@
 
 三大功能页:
   · 配置      —— API Key / 接口地址 / 模型管理(查询·手动·多保存) / 画质 / 默认保存路径
-  · 智能分析  —— 文本对话(展示思考过程) / 上传任意格式文件分析
+  · 文本对话  —— 多轮对话(展示思考过程) / 上传任意格式文件分析 / 回复可复制·查看全文
   · 单次出图  —— 单条提示词，一次可出多张
   · 批量出图  —— 提示词列表(默认5条可增减)，每条单独出 1 张，最多 30 张
 
@@ -34,7 +34,7 @@ from io import BytesIO
 # 全局配置
 # ============================================================
 APP_NAME = "投行部智能图片生成器"
-APP_VERSION = "v4.1"
+APP_VERSION = "v4.2"
 
 # 批量并发上限（云雾 API 支持高并发，最多 30 路同时出图）
 MAX_CONCURRENCY = 30
@@ -499,6 +499,24 @@ class ImageGeneratorApp:
         widget.bind("<Enter>", show)
         widget.bind("<Leave>", hide)
 
+    def _info_dot(self, parent, text):
+        """生成一个精致的圆形 ⓘ 提示标记，鼠标悬停显示参数定义。
+        返回该标记控件（调用方自行 pack/grid）。"""
+        dot = ctk.CTkLabel(
+            parent, text="ⓘ", width=18, height=18,
+            font=("Microsoft YaHei UI", 12),
+            text_color=COLORS["text_secondary"],
+            fg_color="transparent")
+        # 悬停时变色，强化「可交互」的视觉反馈
+        def _enter(_e=None):
+            dot.configure(text_color=COLORS["accent"])
+        def _leave(_e=None):
+            dot.configure(text_color=COLORS["text_secondary"])
+        dot.bind("<Enter>", _enter)
+        dot.bind("<Leave>", _leave)
+        self._bind_tooltip(dot, text)
+        return dot
+
     # ================================================================
     #  整体布局
     # ================================================================
@@ -526,7 +544,7 @@ class ImageGeneratorApp:
         self.nav_config = self._mk_btn(nav, "⚙️  配置", "ghost",
                                        command=lambda: self._switch_tab("config"))
         self.nav_config.pack(side="left", padx=(0, 4))
-        self.nav_analyze = self._mk_btn(nav, "🧠  智能分析", "ghost",
+        self.nav_analyze = self._mk_btn(nav, "💬  文本对话", "ghost",
                                         command=lambda: self._switch_tab("analyze"))
         self.nav_analyze.pack(side="left", padx=4)
         self.nav_single = self._mk_btn(nav, "🖼️  单次出图", "ghost",
@@ -775,34 +793,61 @@ class ImageGeneratorApp:
     def _build_analyze_page(self):
         page = ctk.CTkFrame(self.main, fg_color="transparent")
 
-        # -- 参数栏 --
+        # -- 参数栏（可折叠）--
         param_card = self._mk_card(page)
         param_card.pack(fill="x", pady=(0, 8), padx=2)
 
+        # 标题栏：常用的「模型选择」常驻可见 + 折叠开关 + 清空
         prow = ctk.CTkFrame(param_card, fg_color="transparent")
-        prow.pack(fill="x", padx=16, pady=(12, 6))
+        prow.pack(fill="x", padx=16, pady=(10, 8))
         self._mk_label(prow, "🤖 模型", size=12,
                        color=COLORS["text_secondary"]).pack(side="left", padx=(0, 6))
         self.combo_chat_model = ctk.CTkComboBox(
-            prow, values=CHAT_MODELS, width=200, height=32,
+            prow, values=self._model_list(), width=200, height=32,
             fg_color=COLORS["surface"], button_color=COLORS["accent"],
             button_hover_color=COLORS["accent_hover"],
             border_color=COLORS["divider"], border_width=1,
             text_color=COLORS["text_primary"], font=("Microsoft YaHei UI", 12),
             command=self._on_chat_model_changed)
         self.combo_chat_model.pack(side="left", padx=(0, 4))
-        self.combo_chat_model.set(self.config.get("chat_model", "gpt-4o"))
+        # 默认选中：优先已保存的 chat_model，否则取已保存模型列表第一个
+        _chat_default = self.config.get("chat_model", "")
+        _models = self._model_list()
+        if _chat_default not in _models:
+            _chat_default = _models[0] if _models else "gpt-4o"
+        self.combo_chat_model.set(_chat_default)
         self.lbl_chat_reason = self._mk_label(prow, "", size=10,
                                               color=COLORS["accent"])
         self.lbl_chat_reason.pack(side="left", padx=(2, 0))
+
         self._mk_btn(prow, "🗑 清空", "ghost",
                      command=self._clear_chat).pack(side="right")
+        # 折叠/展开「高级参数」的按钮（默认收起，给对话区让出空间）
+        self.chat_params_open = False
+        self.btn_toggle_params = ctk.CTkButton(
+            prow, text="⚙ 参数 ▾", height=30, width=92, corner_radius=8,
+            fg_color="transparent", hover_color=COLORS["surface"],
+            border_color=COLORS["divider"], border_width=1,
+            text_color=COLORS["text_secondary"], font=("Microsoft YaHei UI", 11),
+            command=self._toggle_chat_params)
+        self.btn_toggle_params.pack(side="right", padx=(0, 8))
+
+        # 折叠容器：温度/最大回复/流式 + System + 文件上传，全部放这里
+        self.chat_param_body = ctk.CTkFrame(param_card, fg_color="transparent")
+        # 默认不 pack（收起）
 
         # 第二行：温度 / 最大回复 / 流式
-        prow2 = ctk.CTkFrame(param_card, fg_color="transparent")
+        prow2 = ctk.CTkFrame(self.chat_param_body, fg_color="transparent")
         prow2.pack(fill="x", padx=16, pady=(0, 6))
         self._mk_label(prow2, "温度", size=11,
-                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 2))
+        self._info_dot(
+            prow2,
+            "温度 (temperature)：控制回复的随机性。\n"
+            "· 取值 0–2，默认 0.7\n"
+            "· 越低越严谨、确定、可复现，适合代码/事实问答\n"
+            "· 越高越发散、有创意，适合头脑风暴/文案创作").pack(
+            side="left", padx=(0, 4))
         self.lbl_temp_val = self._mk_label(prow2, "", size=11,
                                            color=COLORS["accent"], width=30)
         self.temp_slider = ctk.CTkSlider(
@@ -816,7 +861,14 @@ class ImageGeneratorApp:
         self._on_temp_changed(self.temp_slider.get())
 
         self._mk_label(prow2, "最大回复", size=11,
-                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 2))
+        self._info_dot(
+            prow2,
+            "最大回复 (max_tokens)：单次回复的最大长度上限。\n"
+            "· 单位为 token，约 1 个汉字≈1.5 token\n"
+            "· 设太小会导致长回复被中途截断\n"
+            "· 设太大不会浪费，模型按需生成；建议 2048 起步").pack(
+            side="left", padx=(0, 4))
         self.entry_chat_maxtok = ctk.CTkEntry(
             prow2, width=70, height=30, fg_color=COLORS["surface"],
             border_color=COLORS["divider"], border_width=1, corner_radius=6,
@@ -831,10 +883,17 @@ class ImageGeneratorApp:
             fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
             border_color=COLORS["divider"], border_width=2,
             text_color=COLORS["text_primary"],
-            font=("Microsoft YaHei UI", 11)).pack(side="left")
+            font=("Microsoft YaHei UI", 11)).pack(side="left", padx=(0, 2))
+        self._info_dot(
+            prow2,
+            "流式输出 (stream)：是否边生成边逐字显示。\n"
+            "· 开启：像打字机一样实时显示，等待感更低（推荐）\n"
+            "· 关闭：等模型完全生成后一次性显示\n"
+            "· 推理模型的「思考过程」仅在流式下可实时查看").pack(
+            side="left")
 
         # System 提示词
-        srow = ctk.CTkFrame(param_card, fg_color="transparent")
+        srow = ctk.CTkFrame(self.chat_param_body, fg_color="transparent")
         srow.pack(fill="x", padx=16, pady=(0, 8))
         self._mk_label(srow, "System", size=11,
                        color=COLORS["text_secondary"]).pack(side="left", padx=(0, 6))
@@ -848,7 +907,7 @@ class ImageGeneratorApp:
         self.entry_chat_system.insert(0, self.config.get("chat_system", ""))
 
         # 文件分析行：上传任意格式文件 + 已选文件芯片
-        frow = ctk.CTkFrame(param_card, fg_color="transparent")
+        frow = ctk.CTkFrame(self.chat_param_body, fg_color="transparent")
         frow.pack(fill="x", padx=16, pady=(0, 12))
         ctk.CTkButton(
             frow, text="📎 上传文件分析", height=30, width=130, corner_radius=8,
@@ -868,9 +927,10 @@ class ImageGeneratorApp:
         self.chat_scroll.pack(fill="both", expand=True, pady=(0, 8), padx=2)
         self.chat_placeholder = self._mk_label(
             self.chat_scroll,
-            "🧠 在下方输入问题开始分析\n"
+            "💬 在下方输入消息，开始对话\n"
             "推理模型(o1/o3/deepseek-reasoner 等)会展示思考过程\n"
-            "可上传任意格式文件，文本内容会自动随问题一起分析",
+            "可上传任意格式文件，文本内容会自动随消息一起发送\n"
+            "每条回复右下角可「复制」或「查看全文」",
             size=13, color=COLORS["text_secondary"])
         self.chat_placeholder.pack(pady=40)
 
@@ -897,6 +957,17 @@ class ImageGeneratorApp:
 
         self._on_chat_model_changed(self.combo_chat_model.get())
         return page
+
+    def _toggle_chat_params(self):
+        """展开/收起「高级参数」区域，收起时把空间让给对话区。"""
+        self.chat_params_open = not self.chat_params_open
+        if self.chat_params_open:
+            # chat_param_body 的父级是 param_card，直接 pack 会排在标题行 prow 之后
+            self.chat_param_body.pack(fill="x")
+            self.btn_toggle_params.configure(text="⚙ 参数 ▴")
+        else:
+            self.chat_param_body.pack_forget()
+            self.btn_toggle_params.configure(text="⚙ 参数 ▾")
 
     def _on_temp_changed(self, val):
         self.lbl_temp_val.configure(text=f"{float(val):.1f}")
@@ -988,7 +1059,7 @@ class ImageGeneratorApp:
         for w in self.chat_scroll.winfo_children():
             w.destroy()
         self.chat_placeholder = self._mk_label(
-            self.chat_scroll, "🧠 已清空，开始新的分析",
+            self.chat_scroll, "💬 已清空，开始新的对话",
             size=13, color=COLORS["text_secondary"])
         self.chat_placeholder.pack(pady=40)
 
@@ -1002,19 +1073,80 @@ class ImageGeneratorApp:
         bubble = ctk.CTkFrame(
             wrapper, fg_color=(COLORS["accent"] if is_user else COLORS["surface"]),
             corner_radius=12)
+        # 助手气泡占更宽（右留 40），用户气泡靠右（左留 80）
         bubble.pack(anchor="e" if is_user else "w",
-                    padx=(60, 0) if is_user else (0, 60))
+                    fill="x" if not is_user else None,
+                    padx=(80, 0) if is_user else (0, 40))
         prefix = "🧑 你" if is_user else "🤖 助手"
         self._mk_label(bubble, prefix, size=10,
                        color="white" if is_user else COLORS["text_secondary"]).pack(
             anchor="w", padx=12, pady=(8, 0))
+        # 助手回复加宽换行宽度，减少「窄框里上下滚动」的不适感
+        wrap = 760 if not is_user else 520
         lbl = ctk.CTkLabel(
             bubble, text=text, font=("Microsoft YaHei UI", 13),
             text_color="white" if is_user else COLORS["text_primary"],
-            justify="left", wraplength=480)
-        lbl.pack(anchor="w", padx=12, pady=(2, 10))
+            justify="left", wraplength=wrap)
+        lbl.pack(anchor="w", padx=12, pady=(2, 6 if not is_user else 10))
+
+        # 助手气泡：底部操作栏（复制 / 查看全文）
+        if not is_user:
+            actions = ctk.CTkFrame(bubble, fg_color="transparent")
+            actions.pack(anchor="e", fill="x", padx=10, pady=(0, 8))
+            ctk.CTkButton(
+                actions, text="📋 复制", height=24, width=64, corner_radius=6,
+                fg_color="transparent", hover_color=COLORS["card_border"],
+                border_color=COLORS["divider"], border_width=1,
+                text_color=COLORS["text_secondary"], font=("Microsoft YaHei UI", 10),
+                command=lambda l=lbl: self._copy_chat_text(l)).pack(side="right")
+            ctk.CTkButton(
+                actions, text="⤢ 查看全文", height=24, width=84, corner_radius=6,
+                fg_color="transparent", hover_color=COLORS["card_border"],
+                border_color=COLORS["divider"], border_width=1,
+                text_color=COLORS["text_secondary"], font=("Microsoft YaHei UI", 10),
+                command=lambda l=lbl: self._view_chat_fulltext(l)).pack(
+                side="right", padx=(0, 6))
+
         self._chat_scroll_bottom()
         return lbl
+
+    def _copy_chat_text(self, lbl):
+        """复制某条回复的完整文本到剪贴板。"""
+        text = lbl.cget("text") or ""
+        try:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(text)
+            self._set_status(f"✅ 已复制 {len(text)} 字到剪贴板", COLORS["success"])
+        except Exception as e:
+            self._set_status(f"复制失败：{e}", COLORS["error"])
+
+    def _view_chat_fulltext(self, lbl):
+        """弹出独立窗口查看回复全文，可自由滚动、全选复制，解决小框滚动的不适感。"""
+        text = lbl.cget("text") or ""
+        win = ctk.CTkToplevel(self.win)
+        win.title("回复全文")
+        win.geometry("720x600")
+        win.configure(fg_color=COLORS["bg"])
+        win.transient(self.win)
+
+        top = ctk.CTkFrame(win, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        self._mk_label(top, f"回复全文（{len(text)} 字）", size=14,
+                       weight="bold").pack(side="left")
+        ctk.CTkButton(
+            top, text="📋 复制全部", height=30, width=96, corner_radius=8,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            font=("Microsoft YaHei UI", 11),
+            command=lambda: self._copy_chat_text(lbl)).pack(side="right")
+
+        box = ctk.CTkTextbox(
+            win, fg_color=COLORS["surface"], border_width=1,
+            border_color=COLORS["divider"], corner_radius=10, wrap="word",
+            font=("Microsoft YaHei UI", 13), text_color=COLORS["text_primary"])
+        box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        win.after(50, win.lift)
 
     def _add_reason_box(self):
         """推理模型：添加折叠的「思考过程」区域，返回 textbox。"""
@@ -1050,7 +1182,7 @@ class ImageGeneratorApp:
         oa_key = self.config.get("api_key", "").strip()
         if not oa_base or not oa_key:
             messagebox.showwarning(
-                "提示", "智能分析需要 OpenAI 协议接口，请到「配置」页填写接口地址与 API Key")
+                "提示", "文本对话需要 OpenAI 协议接口，请到「配置」页填写接口地址与 API Key")
             self._switch_tab("config")
             return
 
@@ -1145,12 +1277,12 @@ class ImageGeneratorApp:
 
             final = content or "(空响应)"
             self.chat_history.append({"role": "assistant", "content": final})
-            self.log_success(f"分析完成 | {len(final)} 字"
+            self.log_success(f"回复完成 | {len(final)} 字"
                              + (f" | 思考 {len(reason)} 字" if reason else ""))
         except Exception as e:
             err = str(e)
             self._ui(lambda: self._update_content_lbl(f"❌ {err[:200]}"))
-            self.log_error(f"分析失败: {err[:120]}")
+            self.log_error(f"回复失败: {err[:120]}")
         finally:
             self._ui(self._chat_done)
 
@@ -1834,6 +1966,14 @@ class ImageGeneratorApp:
             if hasattr(self, combo):
                 getattr(self, combo).configure(values=values)
                 getattr(self, combo).set(cur)
+        # 文本对话页：同样保持与已保存模型一致；尽量保留当前选择
+        if hasattr(self, "combo_chat_model"):
+            self.combo_chat_model.configure(values=values)
+            cur_chat = self.combo_chat_model.get()
+            if cur_chat not in values:
+                cur_chat = values[0] if values else "gpt-4o"
+                self.combo_chat_model.set(cur_chat)
+                self._on_chat_model_changed(cur_chat)
 
     def _add_model(self, name):
         name = (name or "").strip()
@@ -1937,6 +2077,22 @@ class ImageGeneratorApp:
         # 防抖句柄
         debounce = {"id": None}
 
+        # —— 预归一化：把每个模型 ID 转成「全小写、去除所有分隔符」的形式，
+        #    例如 "Claude-3-Opus" -> "claude3opus"，这样无论用户搜
+        #    "claude opus" / "claude-opus" / "claudeopus" 都能命中。
+        import re as _re
+        _norm_cache = {mid: _re.sub(r"[\s\-_./:]+", "", mid.lower()) for mid in ids}
+
+        def _match(mid, tokens):
+            """多关键词 AND 匹配：每个关键词都要在归一化后的模型名里出现。
+            兼顾原始名与归一化名，确保连字符/空格/大小写都不影响命中。"""
+            raw = mid.lower()
+            norm = _norm_cache[mid]
+            for t in tokens:
+                if t not in raw and t not in norm:
+                    return False
+            return True
+
         self._mk_label(win, f"云雾 API 可用模型（{len(ids)} 个）", size=14,
                        weight="bold").pack(anchor="w", padx=20, pady=(16, 4))
         self._mk_label(
@@ -1949,8 +2105,13 @@ class ImageGeneratorApp:
         search_row = ctk.CTkFrame(win, fg_color="transparent")
         search_row.pack(fill="x", padx=20, pady=(0, 6))
         entry_search = self._mk_entry(search_row)
-        entry_search.configure(placeholder_text="🔍 输入关键词过滤，如 gpt / image / dall")
+        entry_search.configure(
+            placeholder_text="🔍 关键词过滤，支持空格分词，如：claude opus / gpt image")
         entry_search.pack(side="left", fill="x", expand=True)
+
+        # 匹配计数（搜索框正下方，实时反馈）
+        lbl_match = self._mk_label(win, "", size=11, color=COLORS["text_secondary"])
+        lbl_match.pack(anchor="w", padx=20, pady=(0, 4))
 
         scroll = ctk.CTkScrollableFrame(win, fg_color=COLORS["surface"], corner_radius=8)
         scroll.pack(fill="both", expand=True, padx=20, pady=(6, 6))
@@ -1967,15 +2128,29 @@ class ImageGeneratorApp:
         def render(keyword=""):
             for w in scroll.winfo_children():
                 w.destroy()
-            kw = keyword.strip().lower()
-            shown = [m for m in ids if kw in m.lower()] if kw else list(ids)
+            # 关键词拆分：按空格切成多个 token，每个都归一化（去分隔符、转小写），
+            # 实现「多关键词 AND 匹配」。如搜 "claude opus" 会拆成 ["claude","opus"]。
+            raw_kw = keyword.strip().lower()
+            tokens = [_re.sub(r"[\s\-_./:]+", "", t)
+                      for t in raw_kw.split() if t.strip()]
+            tokens = [t for t in tokens if t]
+            if tokens:
+                shown = [m for m in ids if _match(m, tokens)]
+            else:
+                shown = list(ids)
             if not shown:
-                self._mk_label(scroll, "（无匹配模型）", size=12,
-                               color=COLORS["text_secondary"]).pack(
-                    anchor="w", padx=12, pady=10)
+                self._mk_label(
+                    scroll,
+                    f"未找到包含「{keyword.strip()}」的模型\n"
+                    f"· 可尝试更短的关键词，或用空格分词（如：claude opus）\n"
+                    f"· 当前共 {len(ids)} 个可选模型",
+                    size=12, color=COLORS["text_secondary"],
+                    justify="left").pack(anchor="w", padx=12, pady=10)
+                lbl_match.configure(text=f"共匹配 0 个 / {len(ids)} 个模型")
                 return
             # 渲染上限：超出只显示前 N 条，提示用户细化关键词
             truncated = len(shown) > MODEL_RENDER_LIMIT
+            rendered = min(len(shown), MODEL_RENDER_LIMIT)
             for mid in shown[:MODEL_RENDER_LIMIT]:
                 v = ctk.BooleanVar(value=checked[mid])
 
@@ -2008,6 +2183,13 @@ class ImageGeneratorApp:
                     f"请输入更精确的关键词缩小范围",
                     size=11, color=COLORS["warning"]).pack(
                     anchor="w", padx=12, pady=(8, 6))
+            # 匹配计数标签：实时反馈匹配/渲染情况
+            if tokens:
+                lbl_match.configure(
+                    text=f"共匹配 {len(shown)} 个 / {len(ids)} 个，已显示 {rendered} 个")
+            else:
+                lbl_match.configure(
+                    text=f"共 {len(ids)} 个模型，已显示 {rendered} 个")
 
         def _update_count():
             n = sum(1 for ok in checked.values() if ok)
