@@ -684,8 +684,23 @@ class ImageGeneratorApp:
         card1 = self._mk_card(page)
         card1.pack(fill="x", pady=(0, 12), padx=2)
 
-        self._mk_label(card1, "🔑  API 密钥", size=15, weight="bold").pack(
-            anchor="w", padx=20, pady=(18, 12))
+        # 标题行：左侧标题 + 右侧「API密钥申请」按钮 + ⚠️提示
+        title_row = ctk.CTkFrame(card1, fg_color="transparent")
+        title_row.pack(fill="x", padx=20, pady=(18, 12))
+        self._mk_label(title_row, "🔑  API 密钥", size=15, weight="bold").pack(side="left")
+        # 右侧按钮组
+        right_grp = ctk.CTkFrame(title_row, fg_color="transparent")
+        right_grp.pack(side="right")
+        btn_register = self._mk_btn(right_grp, "API密钥申请 ↗", "secondary",
+                                     command=lambda: self._open_url("https://api.wlai.vip/register?aff=vtsa"))
+        btn_register.pack(side="left")
+        # ⚠️ 提示图标，悬浮显示申明
+        warn_lbl = self._mk_label(right_grp, "⚠️", size=13, color=COLORS["warning"])
+        warn_lbl.pack(side="left", padx=(6, 0))
+        self._bind_tooltip(warn_lbl,
+                           "申明：用该链接注册申请api密钥的同时，"
+                           "云雾api会给软件开发的作者提供token的奖励，"
+                           "该部分token的奖励将用于软件本身后续的升级改造，请悉知！")
         kr = ctk.CTkFrame(card1, fg_color="transparent")
         kr.pack(fill="x", padx=20, pady=(0, 6))
         self.entry_key = ctk.CTkEntry(kr, height=40, fg_color=COLORS["surface"],
@@ -2042,6 +2057,12 @@ class ImageGeneratorApp:
         else:
             self.entry_key.configure(show="•")
             self.btn_toggle_key.configure(text="👁")
+
+    @staticmethod
+    def _open_url(url):
+        """用系统默认浏览器打开链接。"""
+        import webbrowser
+        webbrowser.open(url)
 
     def _save_config(self):
         self.config["api_key"] = self.entry_key.get().strip()
