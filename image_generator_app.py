@@ -34,7 +34,7 @@ from io import BytesIO
 # 全局配置
 # ============================================================
 APP_NAME = "投行部智能图片生成器"
-APP_VERSION = "v4.2"
+APP_VERSION = "v4.3.1"
 
 # 批量并发上限（云雾 API 支持高并发，最多 30 路同时出图）
 MAX_CONCURRENCY = 30
