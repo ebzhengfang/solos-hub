@@ -1,0 +1,10 @@
+# 桌面图片生成器依赖
+# Python 3.10+ 推荐
+
+customtkinter>=5.2.2
+requests>=2.32.0
+pillow>=10.0.0
+
+# 以下为标准库，无需安装：
+# tkinter, threading, concurrent.futures, json, os, time,
+# base64, ipaddress, urllib, datetime, pathlib, io
