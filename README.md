@@ -1,22 +1,24 @@
 # 投行部智能图片生成器
 
-基于 customtkinter 构建的桌面图片生成工具，对接速创（速影科技）异步图片生成 API，支持单次出图与批量出图，内置 GPT-Image-2 与 NanoBanana2 两款模型。
+基于 customtkinter 构建的桌面图片生成工具，采用 **OpenAI 兼容协议**，以云雾 API（`https://yunwu.ai/v1`）为例接入，支持单次出图与批量出图，默认出图模型 `gpt-image-2`。
 
-当前版本：**v3.3**
+当前版本：**v4.0**
 
 ---
 
 ## 功能特性
 
 - **三大功能页**
-  - **配置**：填写 API Key、选择模型与默认参数，本地持久化保存
-  - **单次出图**：单张提示词生成，可指定出图张数（1–10）、尺寸/比例、画质档位，支持参考图（图生图）
-  - **批量出图**：多条提示词并发生成，自动下载保存
-- **双模型支持**
-  - `GPT-Image-2 · 标准画质`：按像素尺寸出图
-  - `NanoBanana2 · 高清(1K/2K/4K)`：按宽高比 + 画质档位出图
-- **异步任务流**：提交任务 → 轮询状态 → 下载结果，全程后台线程执行，UI 不卡顿
-- **参考图上传**：支持本地图片上传作为图生图参考
+  - **配置**：填写 API Key、接口地址，内置「模型管理」（查询/手动添加/保存多个模型）与默认画质档位，本地持久化保存
+  - **单次出图**：单张提示词生成，可指定出图张数、尺寸/比例，支持参考图（图生图）
+  - **批量出图**：多条提示词并发生成（最多 30 并发），自动下载保存
+- **OpenAI 兼容协议（同步）**
+  - **文生图**：`POST /v1/images/generations`（application/json）
+  - **图生图**：`POST /v1/images/edits`（multipart/form-data 文件直传，最多 16 张参考图）
+  - **查询模型**：`GET /v1/models`，一键拉取账号可用模型列表供勾选保存
+- **模型管理**：可保存多个模型，下拉框展示已保存项；查询超时可重试，亦可手动输入模型 ID（带 ⚠️ 提示，须与云雾 API 内模型一致）
+- **画质档位**：`auto`（默认，模型自动决定）/ `low` / `medium` / `high`
+- **参考图上传**：本地图片上传，自动压缩后以文件直传方式提交（不再依赖外部 URL）
 - **结果预览与保存**：生成图片即时预览，自动落盘到输出目录
 
 ---
@@ -42,7 +44,7 @@ pip install -r requirements.txt
 python image_generator_app.py
 ```
 
-首次运行后，在「配置」页填入速创 API Key 并保存即可使用。
+首次运行后，在「配置」页填入云雾 API Key 与接口地址（默认 `https://yunwu.ai/v1`），通过「模型管理」查询或手动添加模型并保存即可使用。
 
 ---
 
@@ -77,8 +79,12 @@ pyinstaller 投行部智能图片生成器.spec
 
 ## API 说明
 
-- 速创异步图片接口 base：`https://api.wuyinkeji.com/api/async`
-- 调用流程：`submit_task` 提交 → 轮询 `query_task` 状态 → `extract_result_urls` 取结果 URL → 下载保存
+- 采用 OpenAI 兼容协议，默认 base：`https://yunwu.ai/v1`（可在配置页修改）
+- **文生图**：`POST /v1/images/generations`，JSON 入参 `{model, prompt, n, size, quality?}`
+- **图生图**：`POST /v1/images/edits`，multipart 文件直传，参考图以 `image[]` 字段提交（最多 16 张）
+- **查询模型**：`GET /v1/models`，返回 `data[].id` 列表
+- 响应解析：优先取 `b64_json`（base64 解码），否则下载 `url`
+- 同步协议：请求即返回结果，无需轮询；`n` 固定为 1，批量出图通过多次调用实现
 
 ---
 
@@ -86,9 +92,10 @@ pyinstaller 投行部智能图片生成器.spec
 
 | 版本 | 说明 |
 | --- | --- |
-| **v3.3** | 纯速创单协议稳定版。仅保留 GPT-Image-2 + NanoBanana2，单次出图含「出图张数」控件。作为 Git 版本管理基线。 |
+| **v4.0** | 放弃速创异步协议，全面改用 OpenAI 兼容协议（以云雾 API 为例）。新增模型管理（查询/手动/多保存）、画质档位（auto/low/medium/high）；图生图改为 multipart 文件直传；批量并发上限提升至 30。 |
+| **v3.3** | 纯速创单协议稳定版。仅保留 GPT-Image-2 + NanoBanana2，单次出图含「出图张数」控件。 |
 
-> v3.4 / v3.5 曾实验性接入 OpenAI 协议、云雾 Seedream 图生图与文本对话功能，后整体回滚至 v3.3。相关代码快照保留在 `image_generator_app.v3.5.bak.py`（已被 `.gitignore` 排除，未入库）。
+> v3.4 / v3.5 曾实验性接入 OpenAI 协议、云雾 Seedream 图生图与文本对话功能，后整体回滚至 v3.3，再于 v4.0 正式重构。相关代码快照保留在 `*.bak.py`（已被 `.gitignore` 排除，未入库）。
 
 ---
 
