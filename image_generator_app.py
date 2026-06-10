@@ -76,8 +76,10 @@ TEXT_READABLE_EXTS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     ".log", ".ini", ".conf", ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h",
     ".cs", ".go", ".rs", ".rb", ".php", ".html", ".htm", ".css", ".sql", ".sh",
-    ".bat", ".vue", ".jsx", ".tsx", ".docx",
+    ".bat", ".vue", ".jsx", ".tsx",
 }
+# 需要专用库解析的二进制文档格式（不在 TEXT_READABLE_EXTS 中，由 _build_files_context 单独处理）
+BINARY_DOC_EXTS = {".docx", ".xlsx", ".pptx", ".pdf"}
 FILE_READ_MAX = 200 * 1024  # 单文件最多读取 200KB 文本，避免 prompt 过长
 
 # 色彩方案
@@ -1005,7 +1007,7 @@ class ImageGeneratorApp:
             chip = ctk.CTkFrame(self.chat_files_frame, fg_color=COLORS["surface"],
                                 corner_radius=6)
             chip.pack(side="left", padx=(0, 6))
-            readable = f["ext"] in TEXT_READABLE_EXTS
+            readable = f["ext"] in TEXT_READABLE_EXTS or f["ext"] in BINARY_DOC_EXTS
             tag = "📄" if readable else "📦"
             name = f["name"]
             if len(name) > 18:
@@ -1025,33 +1027,15 @@ class ImageGeneratorApp:
         self._render_chat_file_chips()
 
     def _build_files_context(self):
-        """把已上传文件读成文本上下文。文本类直接读内容，二进制只附元信息。
+        """把已上传文件读成文本上下文。文本类直接读内容，二进制文档用专用库解析。
         返回拼接好的上下文字符串（可能为空）。"""
         if not self.chat_files:
             return ""
         parts = []
         for f in self.chat_files:
             p, name, ext = f["path"], f["name"], f["ext"]
-            if ext == ".docx":
-                # 使用 python-docx 解析 Word 文档
-                try:
-                    from docx import Document
-                    doc = Document(p)
-                    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-                    # 同时读取表格内容
-                    for table in doc.tables:
-                        rows = []
-                        for row in table.rows:
-                            cells = [cell.text.strip() for cell in row.cells]
-                            rows.append(" | ".join(cells))
-                        paragraphs.append(" | " + "\n | ".join(rows))
-                    content = "\n".join(paragraphs)
-                    if len(content.encode('utf-8')) > FILE_READ_MAX:
-                        content = content[:FILE_READ_MAX] + "\n…(内容过长，仅截取前 200KB)…"
-                    parts.append(f"【文件：{name}】\n{content}")
-                except Exception as e:
-                    parts.append(f"【文件：{name}】读取失败：{e}")
-            elif ext in TEXT_READABLE_EXTS:
+            if ext in TEXT_READABLE_EXTS:
+                # ---- 纯文本文件：直接读取 ----
                 try:
                     with open(p, "r", encoding="utf-8", errors="replace") as fh:
                         content = fh.read(FILE_READ_MAX)
@@ -1060,7 +1044,92 @@ class ImageGeneratorApp:
                     parts.append(f"【文件：{name}】\n{content}")
                 except Exception as e:
                     parts.append(f"【文件：{name}】读取失败：{e}")
+            elif ext == ".docx":
+                # ---- Word 文档：python-docx ----
+                try:
+                    from docx import Document
+                    doc = Document(p)
+                    paragraphs = [pp.text for pp in doc.paragraphs if pp.text.strip()]
+                    for table in doc.tables:
+                        rows = []
+                        for row in table.rows:
+                            cells = [cell.text.strip() for cell in row.cells]
+                            rows.append(" | ".join(cells))
+                        if rows:
+                            paragraphs.append("（表格）\n" + "\n".join(rows))
+                    content = "\n".join(paragraphs)
+                    if len(content.encode('utf-8')) > FILE_READ_MAX:
+                        content = content[:FILE_READ_MAX] + "\n…(内容过长，仅截取前 200KB)…"
+                    parts.append(f"【文件：{name}（Word 文档）】\n{content}")
+                except Exception as e:
+                    parts.append(f"【文件：{name}】读取失败：{e}")
+            elif ext == ".xlsx":
+                # ---- Excel 表格：openpyxl ----
+                try:
+                    from openpyxl import load_workbook
+                    wb = load_workbook(p, read_only=True, data_only=True)
+                    all_text = []
+                    for sheet_name in wb.sheetnames:
+                        ws = wb[sheet_name]
+                        rows_text = []
+                        for row in ws.iter_rows(values_only=True):
+                            cells = [str(c) if c is not None else "" for c in row]
+                            if any(cells):  # 跳过全空行
+                                rows_text.append(" | ".join(cells))
+                        if rows_text:
+                            all_text.append(f"--- 工作表：{sheet_name} ---\n" + "\n".join(rows_text))
+                    wb.close()
+                    content = "\n\n".join(all_text)
+                    if len(content.encode('utf-8')) > FILE_READ_MAX:
+                        content = content[:FILE_READ_MAX] + "\n…(内容过长，仅截取前 200KB)…"
+                    parts.append(f"【文件：{name}（Excel 表格）】\n{content}")
+                except Exception as e:
+                    parts.append(f"【文件：{name}】读取失败：{e}")
+            elif ext == ".pptx":
+                # ---- PPT 幻灯片：python-pptx ----
+                try:
+                    from pptx import Presentation
+                    prs = Presentation(p)
+                    all_text = []
+                    for i, slide in enumerate(prs.slides, 1):
+                        slide_text = []
+                        for shape in slide.shapes:
+                            if shape.has_text_frame:
+                                for para in shape.text_frame.paragraphs:
+                                    text = para.text.strip()
+                                    if text:
+                                        slide_text.append(text)
+                            if shape.has_table:
+                                for row in shape.table.rows:
+                                    cells = [cell.text.strip() for cell in row.cells]
+                                    slide_text.append(" | ".join(cells))
+                        if slide_text:
+                            all_text.append(f"--- 第 {i} 页 ---\n" + "\n".join(slide_text))
+                    content = "\n\n".join(all_text)
+                    if len(content.encode('utf-8')) > FILE_READ_MAX:
+                        content = content[:FILE_READ_MAX] + "\n…(内容过长，仅截取前 200KB)…"
+                    parts.append(f"【文件：{name}（PPT 幻灯片）】\n{content}")
+                except Exception as e:
+                    parts.append(f"【文件：{name}】读取失败：{e}")
+            elif ext == ".pdf":
+                # ---- PDF 文档：PyPDF2 ----
+                try:
+                    from PyPDF2 import PdfReader
+                    reader = PdfReader(p)
+                    all_text = []
+                    total_pages = len(reader.pages)
+                    for i, page in enumerate(reader.pages):
+                        text = page.extract_text()
+                        if text and text.strip():
+                            all_text.append(f"--- 第 {i+1}/{total_pages} 页 ---\n{text.strip()}")
+                    content = "\n\n".join(all_text)
+                    if len(content.encode('utf-8')) > FILE_READ_MAX:
+                        content = content[:FILE_READ_MAX] + "\n…(内容过长，仅截取前 200KB)…"
+                    parts.append(f"【文件：{name}（PDF 文档，共 {total_pages} 页）】\n{content}")
+                except Exception as e:
+                    parts.append(f"【文件：{name}】读取失败：{e}")
             else:
+                # ---- 其他二进制格式：只附元信息 ----
                 try:
                     size_kb = os.path.getsize(p) / 1024
                 except Exception:
