@@ -488,7 +488,7 @@ class ImageGeneratorApp:
             tw.configure(fg_color=COLORS["card"])
             lbl = ctk.CTkLabel(tw, text=text, font=("Microsoft YaHei UI", 11),
                                text_color=COLORS["text_primary"],
-                               fg_color=COLORS["card"], wraplength=260,
+                               fg_color=COLORS["card"], wraplength=360,
                                justify="left")
             lbl.pack(padx=10, pady=6)
             tip["win"] = tw
