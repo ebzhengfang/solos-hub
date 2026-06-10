@@ -1070,6 +1070,28 @@ class ImageGeneratorApp:
                     f"非文本格式无法直接解析内容，请根据文件名/类型进行说明或建议）")
         return "以下是用户上传的待分析文件内容：\n\n" + "\n\n".join(parts)
 
+    def _adjust_textbox_height(self, text_box, text):
+        """根据文本内容自适应调整 CTkTextbox 的高度。
+        按换行符和 wrap 宽度估算行数，每行约 20px 高度。"""
+        if not text:
+            text_box.configure(height=30)
+            return
+        # 估算可用宽度（像素）：气泡宽度减去左右 padding
+        # bubble 最大宽度约 700px，text_box padx=8 两边共 16px
+        avail_width = 660
+        # 中文字符约 13px 宽，英文约 7px 宽，保守按平均每字符 10px
+        chars_per_line = max(20, avail_width // 10)
+        lines = text.split('\n')
+        total_lines = 0
+        for line in lines:
+            line_len = len(line)
+            # 空行也算一行
+            wrapped = max(1, (line_len + chars_per_line - 1) // chars_per_line)
+            total_lines += wrapped
+        # 每行高度约 20px，最小 30px，最大 800px（避免过长）
+        height = max(30, min(800, total_lines * 20 + 10))
+        text_box.configure(height=height)
+
     # ---- 对话气泡 ----
     def _clear_chat(self):
         if self.chat_streaming:
@@ -1112,7 +1134,7 @@ class ImageGeneratorApp:
         else:
             # 助手回复用 Textbox，保留段落格式
             text_box = ctk.CTkTextbox(
-                bubble, height=60,  # 初始高度，会根据内容自动调整
+                bubble,
                 fg_color="transparent",
                 border_width=0,
                 corner_radius=0,
@@ -1124,6 +1146,8 @@ class ImageGeneratorApp:
             text_box.pack(anchor="w", fill="x", padx=8, pady=(2, 6))
             text_box.insert("1.0", text)
             text_box.configure(state="disabled")
+            # 自适应高度：根据文本行数计算
+            self._adjust_textbox_height(text_box, text)
             # 绑定标签用于复制/查看全文
             text_box._text = text
             lbl = text_box  # 保持返回类型一致
@@ -1344,6 +1368,8 @@ class ImageGeneratorApp:
                 lbl.insert("1.0", text)
                 lbl.configure(state="disabled")
                 lbl._text = text
+                # 自适应调整高度
+                self._adjust_textbox_height(lbl, text)
             else:
                 # CTkLabel
                 lbl.configure(text=text)
