@@ -76,7 +76,7 @@ TEXT_READABLE_EXTS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     ".log", ".ini", ".conf", ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h",
     ".cs", ".go", ".rs", ".rb", ".php", ".html", ".htm", ".css", ".sql", ".sh",
-    ".bat", ".vue", ".jsx", ".tsx",
+    ".bat", ".vue", ".jsx", ".tsx", ".docx",
 }
 FILE_READ_MAX = 200 * 1024  # 单文件最多读取 200KB 文本，避免 prompt 过长
 
@@ -1032,7 +1032,26 @@ class ImageGeneratorApp:
         parts = []
         for f in self.chat_files:
             p, name, ext = f["path"], f["name"], f["ext"]
-            if ext in TEXT_READABLE_EXTS:
+            if ext == ".docx":
+                # 使用 python-docx 解析 Word 文档
+                try:
+                    from docx import Document
+                    doc = Document(p)
+                    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                    # 同时读取表格内容
+                    for table in doc.tables:
+                        rows = []
+                        for row in table.rows:
+                            cells = [cell.text.strip() for cell in row.cells]
+                            rows.append(" | ".join(cells))
+                        paragraphs.append(" | " + "\n | ".join(rows))
+                    content = "\n".join(paragraphs)
+                    if len(content.encode('utf-8')) > FILE_READ_MAX:
+                        content = content[:FILE_READ_MAX] + "\n…(内容过长，仅截取前 200KB)…"
+                    parts.append(f"【文件：{name}】\n{content}")
+                except Exception as e:
+                    parts.append(f"【文件：{name}】读取失败：{e}")
+            elif ext in TEXT_READABLE_EXTS:
                 try:
                     with open(p, "r", encoding="utf-8", errors="replace") as fh:
                         content = fh.read(FILE_READ_MAX)
@@ -1081,13 +1100,33 @@ class ImageGeneratorApp:
         self._mk_label(bubble, prefix, size=10,
                        color="white" if is_user else COLORS["text_secondary"]).pack(
             anchor="w", padx=12, pady=(8, 0))
-        # 助手回复加宽换行宽度，减少「窄框里上下滚动」的不适感
-        wrap = 760 if not is_user else 520
-        lbl = ctk.CTkLabel(
-            bubble, text=text, font=("Microsoft YaHei UI", 13),
-            text_color="white" if is_user else COLORS["text_primary"],
-            justify="left", wraplength=wrap)
-        lbl.pack(anchor="w", padx=12, pady=(2, 6 if not is_user else 10))
+
+        # 使用 CTkTextbox 替代 CTkLabel，更好地保留段落和换行
+        if is_user:
+            # 用户消息仍用 Label（通常较短）
+            lbl = ctk.CTkLabel(
+                bubble, text=text, font=("Microsoft YaHei UI", 13),
+                text_color="white",
+                justify="left", wraplength=520)
+            lbl.pack(anchor="w", padx=12, pady=(2, 10))
+        else:
+            # 助手回复用 Textbox，保留段落格式
+            text_box = ctk.CTkTextbox(
+                bubble, height=60,  # 初始高度，会根据内容自动调整
+                fg_color="transparent",
+                border_width=0,
+                corner_radius=0,
+                wrap="word",
+                font=("Microsoft YaHei UI", 13),
+                text_color=COLORS["text_primary"],
+                activate_scrollbars=False,
+            )
+            text_box.pack(anchor="w", fill="x", padx=8, pady=(2, 6))
+            text_box.insert("1.0", text)
+            text_box.configure(state="disabled")
+            # 绑定标签用于复制/查看全文
+            text_box._text = text
+            lbl = text_box  # 保持返回类型一致
 
         # 助手气泡：底部操作栏（复制 / 查看全文）
         if not is_user:
@@ -1112,7 +1151,11 @@ class ImageGeneratorApp:
 
     def _copy_chat_text(self, lbl):
         """复制某条回复的完整文本到剪贴板。"""
-        text = lbl.cget("text") or ""
+        # 兼容 CTkLabel 和 CTkTextbox
+        if hasattr(lbl, '_text'):
+            text = lbl._text or ""
+        else:
+            text = lbl.cget("text") or ""
         try:
             self.win.clipboard_clear()
             self.win.clipboard_append(text)
@@ -1122,7 +1165,11 @@ class ImageGeneratorApp:
 
     def _view_chat_fulltext(self, lbl):
         """弹出独立窗口查看回复全文，可自由滚动、全选复制，解决小框滚动的不适感。"""
-        text = lbl.cget("text") or ""
+        # 兼容 CTkLabel 和 CTkTextbox
+        if hasattr(lbl, '_text'):
+            text = lbl._text or ""
+        else:
+            text = lbl.cget("text") or ""
         win = ctk.CTkToplevel(self.win)
         win.title("回复全文")
         win.geometry("720x600")
@@ -1288,7 +1335,18 @@ class ImageGeneratorApp:
 
     def _update_content_lbl(self, text):
         if self._chat_cur_content_lbl is not None:
-            self._chat_cur_content_lbl.configure(text=text)
+            lbl = self._chat_cur_content_lbl
+            # 兼容 CTkLabel 和 CTkTextbox
+            if hasattr(lbl, '_text'):
+                # CTkTextbox
+                lbl.configure(state="normal")
+                lbl.delete("1.0", "end")
+                lbl.insert("1.0", text)
+                lbl.configure(state="disabled")
+                lbl._text = text
+            else:
+                # CTkLabel
+                lbl.configure(text=text)
             self._chat_scroll_bottom()
 
     def _update_reason_box(self, text):
