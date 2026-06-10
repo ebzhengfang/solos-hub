@@ -5,6 +5,7 @@
 
 三大功能页:
   · 配置      —— API Key / 接口地址 / 模型管理(查询·手动·多保存) / 画质 / 默认保存路径
+  · 智能分析  —— 文本对话(展示思考过程) / 上传任意格式文件分析
   · 单次出图  —— 单条提示词，一次可出多张
   · 批量出图  —— 提示词列表(默认5条可增减)，每条单独出 1 张，最多 30 张
 
@@ -33,7 +34,7 @@ from io import BytesIO
 # 全局配置
 # ============================================================
 APP_NAME = "投行部智能图片生成器"
-APP_VERSION = "v4.0"
+APP_VERSION = "v4.1"
 
 # 批量并发上限（云雾 API 支持高并发，最多 30 路同时出图）
 MAX_CONCURRENCY = 30
@@ -41,6 +42,10 @@ BATCH_MAX = 30    # 批量出图：最多提示词条数（每条出 1 张）
 
 # gpt-image-2 画质档位（quality 字段），默认 auto
 QUALITY_OPTIONS = ["auto", "low", "medium", "high"]
+
+# 模型选择弹窗：保存上限 + 单次渲染上限（防止数百模型一次性渲染卡顿）
+MODEL_SAVE_LIMIT = 10
+MODEL_RENDER_LIMIT = 80
 
 # 统一风格指令：批量出图勾选「锁定参考图风格」时，自动拼到每条提示词前，
 # 强制模型把参考图当作视觉模板（配色/版式/字体/质感保持一致），只替换内容。
@@ -51,6 +56,29 @@ STYLE_LOCK_DIRECTIVE = (
     "其余视觉风格元素必须与参考图统一，确保系列图片风格连贯。具体内容："
 )
 BATCH_DEFAULT_ROWS = 5  # 批量页默认提示词行数
+
+# 文本/分析模型预设（OpenAI 协议 /v1/chat/completions）。
+# 名称含 REASONING_HINTS 的模型会尝试展示思考过程（reasoning_content）。
+CHAT_MODELS = [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4.1",
+    "o1",
+    "o3-mini",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "claude-3-7-sonnet-20250219",
+]
+REASONING_HINTS = ("o1", "o3", "reasoner", "r1", "thinking", "qwq")
+
+# 上传文件分析：可直接读取为文本的扩展名 + 单文件读取上限
+TEXT_READABLE_EXTS = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
+    ".log", ".ini", ".conf", ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h",
+    ".cs", ".go", ".rs", ".rb", ".php", ".html", ".htm", ".css", ".sql", ".sh",
+    ".bat", ".vue", ".jsx", ".tsx",
+}
+FILE_READ_MAX = 200 * 1024  # 单文件最多读取 200KB 文本，避免 prompt 过长
 
 # 色彩方案
 COLORS = {
@@ -98,7 +126,19 @@ DEFAULT_CONFIG = {
     "models": ["gpt-image-2"],
     "model": "gpt-image-2",
     "quality": "auto",
+    # 智能分析（文本对话）默认入参
+    "chat_model": "gpt-4o",
+    "chat_system": "你是投行部的专业分析助手，回答严谨、简洁、有条理。",
+    "chat_temperature": 0.7,
+    "chat_max_tokens": 2048,
+    "chat_stream": True,
 }
+
+
+def is_reasoning_model(name: str) -> bool:
+    """模型名包含推理关键字时，认为是推理模型（展示思考过程）。"""
+    n = (name or "").lower()
+    return any(h in n for h in REASONING_HINTS)
 
 
 def load_config():
@@ -242,6 +282,81 @@ def openai_edits(api_base, api_key, model, prompt, size_pixel,
     return _decode_image_item(items[0]), log
 
 
+def openai_chat_stream(openai_base, openai_key, model, messages,
+                       temperature=0.7, max_tokens=2048,
+                       on_reasoning=None, on_content=None, stop_flag=None):
+    """OpenAI 协议流式对话 /v1/chat/completions。
+    on_reasoning(text_delta): 推理增量回调（如有 reasoning_content）
+    on_content(text_delta):   正文增量回调
+    stop_flag(): 返回 True 则中断
+    返回 (full_reasoning, full_content)。"""
+    base = _normalize_openai_base(openai_base)
+    url = f"{base}/chat/completions"
+    headers = {"Authorization": f"Bearer {openai_key}",
+               "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages,
+               "temperature": temperature, "stream": True}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+
+    full_reason, full_content = [], []
+    with requests.post(url, json=payload, headers=headers,
+                       stream=True, timeout=300) as r:
+        # SSE 流 Content-Type 常无 charset，requests 会按 ISO-8859-1 解码导致中文乱码，
+        # 这里强制 UTF-8 解码。
+        r.encoding = "utf-8"
+        if r.status_code >= 400:
+            raise RuntimeError(f"对话请求失败 (HTTP {r.status_code}): {r.text[:300]}")
+        for raw in r.iter_lines(decode_unicode=True):
+            if stop_flag and stop_flag():
+                break
+            if not raw:
+                continue
+            line = raw.strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                chunk = json.loads(line)
+            except Exception:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {}) or {}
+            rc = delta.get("reasoning_content")
+            if rc:
+                full_reason.append(rc)
+                if on_reasoning:
+                    on_reasoning(rc)
+            c = delta.get("content")
+            if c:
+                full_content.append(c)
+                if on_content:
+                    on_content(c)
+    return "".join(full_reason), "".join(full_content)
+
+
+def openai_chat_once(openai_base, openai_key, model, messages,
+                     temperature=0.7, max_tokens=2048):
+    """非流式对话，返回 (reasoning, content)。用于关闭流式时。"""
+    base = _normalize_openai_base(openai_base)
+    url = f"{base}/chat/completions"
+    headers = {"Authorization": f"Bearer {openai_key}",
+               "Content-Type": "application/json"}
+    payload = {"model": model, "messages": messages,
+               "temperature": temperature, "stream": False}
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    r = requests.post(url, json=payload, headers=headers, timeout=300)
+    data = _safe_json(r, "对话")
+    if r.status_code >= 400 or (isinstance(data, dict) and "error" in data):
+        raise RuntimeError(_extract_error(data, r.status_code))
+    msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+    return msg.get("reasoning_content", "") or "", msg.get("content", "") or ""
+
+
 
 
 # ============================================================
@@ -294,6 +409,17 @@ class ImageGeneratorApp:
         # 两个生成页各自的上下文
         self.ctx_single = PageContext()
         self.ctx_batch = PageContext()
+
+        # 智能分析（文本对话）状态
+        self.chat_history = []            # [{"role","content"}] 不含 system
+        self.chat_streaming = False
+        self.chat_stop = False
+        self.chat_placeholder = None
+        self.chat_files = []              # 待分析文件 [{"path","name","ext"}]
+        self._chat_cur_content_lbl = None
+        self._chat_cur_reason_box = None
+        self._chat_cur_content_buf = ""
+        self._chat_cur_reason_buf = ""
 
         self._build()
 
@@ -400,6 +526,9 @@ class ImageGeneratorApp:
         self.nav_config = self._mk_btn(nav, "⚙️  配置", "ghost",
                                        command=lambda: self._switch_tab("config"))
         self.nav_config.pack(side="left", padx=(0, 4))
+        self.nav_analyze = self._mk_btn(nav, "🧠  智能分析", "ghost",
+                                        command=lambda: self._switch_tab("analyze"))
+        self.nav_analyze.pack(side="left", padx=4)
         self.nav_single = self._mk_btn(nav, "🖼️  单次出图", "ghost",
                                        command=lambda: self._switch_tab("single"))
         self.nav_single.pack(side="left", padx=4)
@@ -412,10 +541,12 @@ class ImageGeneratorApp:
         self.main.pack(fill="both", expand=True, padx=24)
 
         self.page_config = self._build_config_page()
+        self.page_analyze = self._build_analyze_page()
         self.page_single = self._build_single_page()
         self.page_batch = self._build_batch_page()
 
         self.page_config.pack_forget()
+        self.page_analyze.pack_forget()
         self.page_batch.pack_forget()
         self.page_single.pack(fill="both", expand=True, pady=(4, 0))
         self.current_page = "single"
@@ -637,6 +768,412 @@ class ImageGeneratorApp:
             anchor="w", padx=20, pady=(0, 18))
 
         return page
+
+    # ================================================================
+    #  智能分析页（文本对话 + 思考过程 + 文件分析）
+    # ================================================================
+    def _build_analyze_page(self):
+        page = ctk.CTkFrame(self.main, fg_color="transparent")
+
+        # -- 参数栏 --
+        param_card = self._mk_card(page)
+        param_card.pack(fill="x", pady=(0, 8), padx=2)
+
+        prow = ctk.CTkFrame(param_card, fg_color="transparent")
+        prow.pack(fill="x", padx=16, pady=(12, 6))
+        self._mk_label(prow, "🤖 模型", size=12,
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 6))
+        self.combo_chat_model = ctk.CTkComboBox(
+            prow, values=CHAT_MODELS, width=200, height=32,
+            fg_color=COLORS["surface"], button_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_hover"],
+            border_color=COLORS["divider"], border_width=1,
+            text_color=COLORS["text_primary"], font=("Microsoft YaHei UI", 12),
+            command=self._on_chat_model_changed)
+        self.combo_chat_model.pack(side="left", padx=(0, 4))
+        self.combo_chat_model.set(self.config.get("chat_model", "gpt-4o"))
+        self.lbl_chat_reason = self._mk_label(prow, "", size=10,
+                                              color=COLORS["accent"])
+        self.lbl_chat_reason.pack(side="left", padx=(2, 0))
+        self._mk_btn(prow, "🗑 清空", "ghost",
+                     command=self._clear_chat).pack(side="right")
+
+        # 第二行：温度 / 最大回复 / 流式
+        prow2 = ctk.CTkFrame(param_card, fg_color="transparent")
+        prow2.pack(fill="x", padx=16, pady=(0, 6))
+        self._mk_label(prow2, "温度", size=11,
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
+        self.lbl_temp_val = self._mk_label(prow2, "", size=11,
+                                           color=COLORS["accent"], width=30)
+        self.temp_slider = ctk.CTkSlider(
+            prow2, from_=0, to=2, number_of_steps=20, width=130,
+            fg_color=COLORS["surface"], progress_color=COLORS["accent"],
+            button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
+            command=self._on_temp_changed)
+        self.temp_slider.pack(side="left", padx=(0, 2))
+        self.temp_slider.set(float(self.config.get("chat_temperature", 0.7)))
+        self.lbl_temp_val.pack(side="left", padx=(0, 12))
+        self._on_temp_changed(self.temp_slider.get())
+
+        self._mk_label(prow2, "最大回复", size=11,
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 4))
+        self.entry_chat_maxtok = ctk.CTkEntry(
+            prow2, width=70, height=30, fg_color=COLORS["surface"],
+            border_color=COLORS["divider"], border_width=1, corner_radius=6,
+            text_color=COLORS["text_primary"], font=("Consolas", 11))
+        self.entry_chat_maxtok.pack(side="left", padx=(0, 12))
+        self.entry_chat_maxtok.insert(0, str(self.config.get("chat_max_tokens", 2048)))
+
+        self.chat_stream_var = ctk.BooleanVar(value=self.config.get("chat_stream", True))
+        ctk.CTkCheckBox(
+            prow2, text=" 流式输出", variable=self.chat_stream_var,
+            checkbox_width=16, checkbox_height=16, corner_radius=4,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            border_color=COLORS["divider"], border_width=2,
+            text_color=COLORS["text_primary"],
+            font=("Microsoft YaHei UI", 11)).pack(side="left")
+
+        # System 提示词
+        srow = ctk.CTkFrame(param_card, fg_color="transparent")
+        srow.pack(fill="x", padx=16, pady=(0, 8))
+        self._mk_label(srow, "System", size=11,
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 6))
+        self.entry_chat_system = ctk.CTkEntry(
+            srow, height=30, fg_color=COLORS["surface"],
+            border_color=COLORS["divider"], border_width=1, corner_radius=6,
+            text_color=COLORS["text_primary"], font=("Microsoft YaHei UI", 11),
+            placeholder_text="系统提示词（设定助手角色）",
+            placeholder_text_color=COLORS["text_secondary"])
+        self.entry_chat_system.pack(side="left", fill="x", expand=True)
+        self.entry_chat_system.insert(0, self.config.get("chat_system", ""))
+
+        # 文件分析行：上传任意格式文件 + 已选文件芯片
+        frow = ctk.CTkFrame(param_card, fg_color="transparent")
+        frow.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkButton(
+            frow, text="📎 上传文件分析", height=30, width=130, corner_radius=8,
+            fg_color=COLORS["surface"], hover_color=COLORS["card_border"],
+            border_color=COLORS["divider"], border_width=1,
+            text_color=COLORS["text_primary"], font=("Microsoft YaHei UI", 11),
+            command=self._add_chat_files).pack(side="left", padx=(0, 8))
+        self.chat_files_frame = ctk.CTkFrame(frow, fg_color="transparent")
+        self.chat_files_frame.pack(side="left", fill="x", expand=True)
+        self._mk_label(
+            frow, "支持任意格式（文本类直接解析内容）", size=10,
+            color=COLORS["text_secondary"]).pack(side="right")
+
+        # -- 对话消息区（滚动）--
+        self.chat_scroll = ctk.CTkScrollableFrame(
+            page, fg_color=COLORS["card"], corner_radius=12)
+        self.chat_scroll.pack(fill="both", expand=True, pady=(0, 8), padx=2)
+        self.chat_placeholder = self._mk_label(
+            self.chat_scroll,
+            "🧠 在下方输入问题开始分析\n"
+            "推理模型(o1/o3/deepseek-reasoner 等)会展示思考过程\n"
+            "可上传任意格式文件，文本内容会自动随问题一起分析",
+            size=13, color=COLORS["text_secondary"])
+        self.chat_placeholder.pack(pady=40)
+
+        # -- 输入区 --
+        input_card = self._mk_card(page)
+        input_card.pack(fill="x", padx=2)
+        irow = ctk.CTkFrame(input_card, fg_color="transparent")
+        irow.pack(fill="x", padx=12, pady=12)
+        self.text_chat_input = ctk.CTkTextbox(
+            irow, height=64, fg_color=COLORS["surface"],
+            border_color=COLORS["divider"], border_width=1, corner_radius=8,
+            wrap="word", font=("Microsoft YaHei UI", 13),
+            text_color=COLORS["text_primary"])
+        self.text_chat_input.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self.text_chat_input.bind("<Return>", self._on_chat_enter)
+        self.text_chat_input.bind("<Shift-Return>", lambda e: None)
+
+        self.btn_chat_send = ctk.CTkButton(
+            irow, text="发送", width=72, height=64, corner_radius=10,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+            font=("Microsoft YaHei UI", 14, "bold"),
+            command=self._send_chat)
+        self.btn_chat_send.pack(side="left")
+
+        self._on_chat_model_changed(self.combo_chat_model.get())
+        return page
+
+    def _on_temp_changed(self, val):
+        self.lbl_temp_val.configure(text=f"{float(val):.1f}")
+
+    def _on_chat_model_changed(self, choice):
+        self.config["chat_model"] = choice
+        if is_reasoning_model(choice):
+            self.lbl_chat_reason.configure(text="🧠 推理模型（显示思考过程）")
+        else:
+            self.lbl_chat_reason.configure(text="")
+
+    def _on_chat_enter(self, event):
+        if event.state & 0x0001:   # Shift+回车换行
+            return
+        self._send_chat()
+        return "break"
+
+    # ---- 文件分析 ----
+    def _add_chat_files(self):
+        paths = filedialog.askopenfilenames(title="选择要分析的文件（任意格式）")
+        if not paths:
+            return
+        for p in paths:
+            if any(f["path"] == p for f in self.chat_files):
+                continue
+            ext = os.path.splitext(p)[1].lower()
+            self.chat_files.append({"path": p, "name": os.path.basename(p), "ext": ext})
+        self._render_chat_file_chips()
+        self.log_info(f"已添加待分析文件，共 {len(self.chat_files)} 个")
+
+    def _render_chat_file_chips(self):
+        for w in self.chat_files_frame.winfo_children():
+            w.destroy()
+        for f in self.chat_files:
+            chip = ctk.CTkFrame(self.chat_files_frame, fg_color=COLORS["surface"],
+                                corner_radius=6)
+            chip.pack(side="left", padx=(0, 6))
+            readable = f["ext"] in TEXT_READABLE_EXTS
+            tag = "📄" if readable else "📦"
+            name = f["name"]
+            if len(name) > 18:
+                name = name[:15] + "…"
+            self._mk_label(chip, f"{tag} {name}", size=10,
+                           color=COLORS["text_primary"]).pack(side="left", padx=(8, 2),
+                                                              pady=4)
+            ctk.CTkButton(
+                chip, text="✕", width=18, height=18, corner_radius=4,
+                fg_color="transparent", hover_color=COLORS["card_border"],
+                text_color=COLORS["text_secondary"], font=("Microsoft YaHei UI", 10),
+                command=lambda fp=f["path"]: self._remove_chat_file(fp)).pack(
+                side="left", padx=(0, 4))
+
+    def _remove_chat_file(self, path):
+        self.chat_files = [f for f in self.chat_files if f["path"] != path]
+        self._render_chat_file_chips()
+
+    def _build_files_context(self):
+        """把已上传文件读成文本上下文。文本类直接读内容，二进制只附元信息。
+        返回拼接好的上下文字符串（可能为空）。"""
+        if not self.chat_files:
+            return ""
+        parts = []
+        for f in self.chat_files:
+            p, name, ext = f["path"], f["name"], f["ext"]
+            if ext in TEXT_READABLE_EXTS:
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read(FILE_READ_MAX)
+                    if os.path.getsize(p) > FILE_READ_MAX:
+                        content += "\n…(内容过长，仅截取前 200KB)…"
+                    parts.append(f"【文件：{name}】\n{content}")
+                except Exception as e:
+                    parts.append(f"【文件：{name}】读取失败：{e}")
+            else:
+                try:
+                    size_kb = os.path.getsize(p) / 1024
+                except Exception:
+                    size_kb = 0
+                parts.append(
+                    f"【文件：{name}】（{ext or '未知'} 格式，{size_kb:.0f}KB，"
+                    f"非文本格式无法直接解析内容，请根据文件名/类型进行说明或建议）")
+        return "以下是用户上传的待分析文件内容：\n\n" + "\n\n".join(parts)
+
+    # ---- 对话气泡 ----
+    def _clear_chat(self):
+        if self.chat_streaming:
+            return
+        self.chat_history = []
+        for w in self.chat_scroll.winfo_children():
+            w.destroy()
+        self.chat_placeholder = self._mk_label(
+            self.chat_scroll, "🧠 已清空，开始新的分析",
+            size=13, color=COLORS["text_secondary"])
+        self.chat_placeholder.pack(pady=40)
+
+    def _add_chat_bubble(self, role, text=""):
+        if self.chat_placeholder is not None:
+            self.chat_placeholder.destroy()
+            self.chat_placeholder = None
+        is_user = (role == "user")
+        wrapper = ctk.CTkFrame(self.chat_scroll, fg_color="transparent")
+        wrapper.pack(fill="x", padx=10, pady=(6, 2))
+        bubble = ctk.CTkFrame(
+            wrapper, fg_color=(COLORS["accent"] if is_user else COLORS["surface"]),
+            corner_radius=12)
+        bubble.pack(anchor="e" if is_user else "w",
+                    padx=(60, 0) if is_user else (0, 60))
+        prefix = "🧑 你" if is_user else "🤖 助手"
+        self._mk_label(bubble, prefix, size=10,
+                       color="white" if is_user else COLORS["text_secondary"]).pack(
+            anchor="w", padx=12, pady=(8, 0))
+        lbl = ctk.CTkLabel(
+            bubble, text=text, font=("Microsoft YaHei UI", 13),
+            text_color="white" if is_user else COLORS["text_primary"],
+            justify="left", wraplength=480)
+        lbl.pack(anchor="w", padx=12, pady=(2, 10))
+        self._chat_scroll_bottom()
+        return lbl
+
+    def _add_reason_box(self):
+        """推理模型：添加折叠的「思考过程」区域，返回 textbox。"""
+        wrapper = ctk.CTkFrame(self.chat_scroll, fg_color="transparent")
+        wrapper.pack(fill="x", padx=10, pady=(6, 0))
+        box_frame = ctk.CTkFrame(wrapper, fg_color=COLORS["bg"], corner_radius=10,
+                                 border_width=1, border_color=COLORS["divider"])
+        box_frame.pack(anchor="w", fill="x", padx=(0, 60))
+        self._mk_label(box_frame, "🧠 思考过程", size=10,
+                       color=COLORS["text_secondary"]).pack(anchor="w", padx=12,
+                                                            pady=(8, 2))
+        box = ctk.CTkTextbox(
+            box_frame, height=90, fg_color=COLORS["bg"], border_width=0,
+            wrap="word", font=("Microsoft YaHei UI", 11),
+            text_color=COLORS["text_secondary"])
+        box.pack(fill="x", padx=8, pady=(0, 8))
+        box.configure(state="disabled")
+        return box
+
+    def _chat_scroll_bottom(self):
+        try:
+            self.chat_scroll._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+
+    def _send_chat(self):
+        if self.chat_streaming:
+            return
+        msg = self.text_chat_input.get("1.0", "end-1c").strip()
+        if not msg and not self.chat_files:
+            return
+        oa_base = self.config.get("api_base", "").strip()
+        oa_key = self.config.get("api_key", "").strip()
+        if not oa_base or not oa_key:
+            messagebox.showwarning(
+                "提示", "智能分析需要 OpenAI 协议接口，请到「配置」页填写接口地址与 API Key")
+            self._switch_tab("config")
+            return
+
+        model = self.combo_chat_model.get().strip()
+        try:
+            temperature = float(self.temp_slider.get())
+        except Exception:
+            temperature = 0.7
+        try:
+            max_tokens = int(self.entry_chat_maxtok.get().strip())
+        except Exception:
+            max_tokens = 2048
+        system = self.entry_chat_system.get().strip()
+        stream = bool(self.chat_stream_var.get())
+
+        self.config.update({
+            "chat_model": model, "chat_system": system,
+            "chat_temperature": temperature, "chat_max_tokens": max_tokens,
+            "chat_stream": stream,
+        })
+        save_config(self.config)
+
+        # 组装本轮用户消息：文件上下文 + 文本问题
+        file_ctx = self._build_files_context()
+        if file_ctx:
+            user_for_api = file_ctx + "\n\n【我的问题】\n" + (msg or "请分析以上文件内容。")
+            bubble_text = (msg or "请分析以上文件内容。") + \
+                f"\n\n📎 已附 {len(self.chat_files)} 个文件"
+        else:
+            user_for_api = msg
+            bubble_text = msg
+
+        self._add_chat_bubble("user", bubble_text)
+        self.chat_history.append({"role": "user", "content": user_for_api})
+        self.text_chat_input.delete("1.0", "end")
+        # 文件随本轮提交后清空（已并入历史）
+        self.chat_files = []
+        self._render_chat_file_chips()
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.extend(self.chat_history)
+
+        reason_box = self._add_reason_box() if is_reasoning_model(model) else None
+        content_lbl = self._add_chat_bubble("assistant", "")
+        self._chat_cur_content_lbl = content_lbl
+        self._chat_cur_reason_box = reason_box
+        self._chat_cur_content_buf = ""
+        self._chat_cur_reason_buf = ""
+
+        self.chat_streaming = True
+        self.chat_stop = False
+        self.btn_chat_send.configure(text="生成中", state="disabled",
+                                     fg_color=COLORS["surface"],
+                                     text_color=COLORS["text_secondary"])
+        t = threading.Thread(
+            target=self._chat_worker,
+            args=(oa_base, oa_key, model, messages, temperature, max_tokens, stream),
+            daemon=True)
+        t.start()
+
+    def _chat_worker(self, oa_base, oa_key, model, messages,
+                     temperature, max_tokens, stream):
+        try:
+            self.log_request("POST",
+                             f"{_normalize_openai_base(oa_base)}/chat/completions",
+                             {"model": model, "temperature": temperature,
+                              "max_tokens": max_tokens, "stream": stream})
+
+            def on_reason(d):
+                self._chat_cur_reason_buf += d
+                self._ui(lambda: self._update_reason_box(self._chat_cur_reason_buf))
+
+            def on_content(d):
+                self._chat_cur_content_buf += d
+                self._ui(lambda: self._update_content_lbl(self._chat_cur_content_buf))
+
+            if stream:
+                reason, content = openai_chat_stream(
+                    oa_base, oa_key, model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    on_reasoning=on_reason, on_content=on_content,
+                    stop_flag=lambda: self.chat_stop)
+            else:
+                reason, content = openai_chat_once(
+                    oa_base, oa_key, model, messages,
+                    temperature=temperature, max_tokens=max_tokens)
+                if reason:
+                    self._ui(lambda r=reason: self._update_reason_box(r))
+                self._ui(lambda c=content: self._update_content_lbl(c))
+
+            final = content or "(空响应)"
+            self.chat_history.append({"role": "assistant", "content": final})
+            self.log_success(f"分析完成 | {len(final)} 字"
+                             + (f" | 思考 {len(reason)} 字" if reason else ""))
+        except Exception as e:
+            err = str(e)
+            self._ui(lambda: self._update_content_lbl(f"❌ {err[:200]}"))
+            self.log_error(f"分析失败: {err[:120]}")
+        finally:
+            self._ui(self._chat_done)
+
+    def _update_content_lbl(self, text):
+        if self._chat_cur_content_lbl is not None:
+            self._chat_cur_content_lbl.configure(text=text)
+            self._chat_scroll_bottom()
+
+    def _update_reason_box(self, text):
+        box = self._chat_cur_reason_box
+        if box is not None:
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            box.configure(state="disabled")
+            self._chat_scroll_bottom()
+
+    def _chat_done(self):
+        self.chat_streaming = False
+        self.btn_chat_send.configure(text="发送", state="normal",
+                                     fg_color=COLORS["accent"], text_color="white")
+        self._chat_cur_content_lbl = None
+        self._chat_cur_reason_box = None
 
     # ================================================================
     #  单次出图页
@@ -1054,8 +1591,10 @@ class ImageGeneratorApp:
             font=("Microsoft YaHei UI", 11),
             command=lambda c=ctx: self._clear_ref_images(c)).pack(side="right", padx=(0, 6))
 
-        # 缩略图行（小尺寸）
-        ctx.ref_thumb_frame = ctk.CTkFrame(ref_card, fg_color="transparent")
+        # 缩略图行（小尺寸）—— 固定较矮高度，空状态不再撑出大片留白
+        ctx.ref_thumb_frame = ctk.CTkFrame(ref_card, fg_color="transparent",
+                                            height=58)
+        ctx.ref_thumb_frame.pack_propagate(False)
         ctx.ref_thumb_frame.pack(fill="x", padx=16, pady=(0, 4))
 
         # URL 行（紧凑）—— gpt-image-2 图生图走文件上传，URL 仅作占位提示
@@ -1185,10 +1724,13 @@ class ImageGeneratorApp:
         if self.current_page == tab:
             return
         self.page_config.pack_forget()
+        self.page_analyze.pack_forget()
         self.page_single.pack_forget()
         self.page_batch.pack_forget()
         if tab == "config":
             self.page_config.pack(fill="both", expand=True, pady=(4, 0))
+        elif tab == "analyze":
+            self.page_analyze.pack(fill="both", expand=True, pady=(4, 0))
         elif tab == "single":
             self.page_single.pack(fill="both", expand=True, pady=(4, 0))
         else:
@@ -1198,6 +1740,7 @@ class ImageGeneratorApp:
 
     def _highlight_nav(self, active):
         for btn, tab in [(self.nav_config, "config"),
+                         (self.nav_analyze, "analyze"),
                          (self.nav_single, "single"),
                          (self.nav_batch, "batch")]:
             if tab == active:
@@ -1300,6 +1843,14 @@ class ImageGeneratorApp:
         if name in models:
             self._set_status(f"模型 {name} 已存在", COLORS["warning"])
             return
+        if len(models) >= MODEL_SAVE_LIMIT:
+            messagebox.showinfo(
+                "提示",
+                f"最多只能保存 {MODEL_SAVE_LIMIT} 个模型。\n"
+                f"请先在「配置」页删除部分已保存模型后再添加。")
+            self._set_status(
+                f"已达上限 {MODEL_SAVE_LIMIT} 个，未添加 {name}", COLORS["warning"])
+            return
         models.append(name)
         self.config["models"] = models
         self.config["model"] = name
@@ -1368,7 +1919,10 @@ class ImageGeneratorApp:
         self.log_error(f"查询模型失败: {msg[:120]}")
 
     def _show_model_picker(self, ids):
-        """弹窗列出查询到的模型，支持模糊搜索过滤 + 多选勾选，确认后批量加入。"""
+        """弹窗列出查询到的模型，支持模糊搜索过滤 + 多选勾选，确认后批量加入。
+        性能优化：搜索框防抖（250ms）+ 渲染上限（MODEL_RENDER_LIMIT 条），
+        避免一次性渲染数百个复选框导致界面卡死。
+        约束：保存的模型总数最多 MODEL_SAVE_LIMIT 个。"""
         win = ctk.CTkToplevel(self.win)
         win.title("选择要添加的模型")
         win.geometry("460x600")
@@ -1377,16 +1931,21 @@ class ImageGeneratorApp:
         win.grab_set()
 
         existing = set(self.config.get("models") or [])
+        existing_n = len(existing)            # 已保存数（计入 10 个上限）
         # 勾选状态用字典持久保存（跨过滤刷新不丢失），key=模型ID
         checked = {mid: False for mid in ids}
+        # 防抖句柄
+        debounce = {"id": None}
 
         self._mk_label(win, f"云雾 API 可用模型（{len(ids)} 个）", size=14,
                        weight="bold").pack(anchor="w", padx=20, pady=(16, 4))
-        self._mk_label(win, "输入关键词模糊筛选，勾选后点底部「添加所选」（支持多选）",
-                       size=11, color=COLORS["text_secondary"]).pack(
+        self._mk_label(
+            win, f"输入关键词模糊筛选，勾选后点底部「添加所选」"
+                 f"（最多保存 {MODEL_SAVE_LIMIT} 个）",
+            size=11, color=COLORS["text_secondary"]).pack(
             anchor="w", padx=20, pady=(0, 8))
 
-        # 搜索框 + 全选/清空
+        # 搜索框 + 清空
         search_row = ctk.CTkFrame(win, fg_color="transparent")
         search_row.pack(fill="x", padx=20, pady=(0, 6))
         entry_search = self._mk_entry(search_row)
@@ -1399,6 +1958,12 @@ class ImageGeneratorApp:
         lbl_count = self._mk_label(win, "", size=11, color=COLORS["accent"])
         lbl_count.pack(anchor="w", padx=20, pady=(0, 4))
 
+        def _saved_total():
+            """当前会勾选保存后的总数 = 已保存 + 本次新勾选(不在已保存里的)。"""
+            new_checked = sum(1 for m, ok in checked.items()
+                              if ok and m not in existing)
+            return existing_n + new_checked
+
         def render(keyword=""):
             for w in scroll.winfo_children():
                 w.destroy()
@@ -1408,11 +1973,24 @@ class ImageGeneratorApp:
                 self._mk_label(scroll, "（无匹配模型）", size=12,
                                color=COLORS["text_secondary"]).pack(
                     anchor="w", padx=12, pady=10)
-            for mid in shown:
+                return
+            # 渲染上限：超出只显示前 N 条，提示用户细化关键词
+            truncated = len(shown) > MODEL_RENDER_LIMIT
+            for mid in shown[:MODEL_RENDER_LIMIT]:
                 v = ctk.BooleanVar(value=checked[mid])
 
                 def _on_toggle(name=mid, var=v):
-                    checked[name] = var.get()
+                    want = var.get()
+                    # 勾选时校验 10 个上限（取消勾选无需校验）
+                    if want and name not in existing and _saved_total() >= MODEL_SAVE_LIMIT:
+                        var.set(False)          # 撤销本次勾选
+                        checked[name] = False
+                        messagebox.showinfo(
+                            "提示",
+                            f"最多只能保存 {MODEL_SAVE_LIMIT} 个模型。\n"
+                            f"如需添加新模型，请先在「配置」页删除部分已保存模型。")
+                        return
+                    checked[name] = want
                     _update_count()
 
                 label = f"  {mid}" + ("  (已保存)" if mid in existing else "")
@@ -1423,18 +2001,18 @@ class ImageGeneratorApp:
                     border_color=COLORS["divider"], border_width=2,
                     text_color=COLORS["text_primary"],
                     font=("Microsoft YaHei UI", 12)).pack(anchor="w", padx=12, pady=4)
+            if truncated:
+                self._mk_label(
+                    scroll,
+                    f"… 共匹配 {len(shown)} 个，仅显示前 {MODEL_RENDER_LIMIT} 个，"
+                    f"请输入更精确的关键词缩小范围",
+                    size=11, color=COLORS["warning"]).pack(
+                    anchor="w", padx=12, pady=(8, 6))
 
         def _update_count():
             n = sum(1 for ok in checked.values() if ok)
-            lbl_count.configure(text=f"已勾选 {n} 个")
-
-        def _select_all_visible():
-            kw = entry_search.get().strip().lower()
-            shown = [m for m in ids if kw in m.lower()] if kw else list(ids)
-            for m in shown:
-                checked[m] = True
-            render(entry_search.get())
-            _update_count()
+            lbl_count.configure(
+                text=f"已勾选 {n} 个  |  保存后共 {_saved_total()}/{MODEL_SAVE_LIMIT} 个")
 
         def _clear_all():
             for m in checked:
@@ -1442,13 +2020,20 @@ class ImageGeneratorApp:
             render(entry_search.get())
             _update_count()
 
-        self._mk_btn(search_row, "全选", "secondary",
-                     command=_select_all_visible).pack(side="left", padx=(8, 0))
-        self._mk_btn(search_row, "清空", "ghost",
-                     command=_clear_all).pack(side="left", padx=(6, 0))
+        self._mk_btn(search_row, "清空勾选", "ghost",
+                     command=_clear_all).pack(side="left", padx=(8, 0))
 
-        # 输入即时过滤
-        entry_search.bind("<KeyRelease>", lambda e: render(entry_search.get()))
+        def _on_key(_e=None):
+            # 防抖：取消上一个待执行的渲染，250ms 后再渲染，避免每次按键全量重绘
+            if debounce["id"] is not None:
+                try:
+                    win.after_cancel(debounce["id"])
+                except Exception:
+                    pass
+            debounce["id"] = win.after(
+                250, lambda: render(entry_search.get()))
+
+        entry_search.bind("<KeyRelease>", _on_key)
 
         def do_add():
             chosen = [m for m, ok in checked.items() if ok]
