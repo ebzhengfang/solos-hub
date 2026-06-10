@@ -37,7 +37,6 @@ APP_VERSION = "v4.0"
 
 # 批量并发上限（云雾 API 支持高并发，最多 30 路同时出图）
 MAX_CONCURRENCY = 30
-SINGLE_MAX = 10   # 单次出图：一条提示词最多张数
 BATCH_MAX = 30    # 批量出图：最多提示词条数（每条出 1 张）
 
 # gpt-image-2 画质档位（quality 字段），默认 auto
@@ -73,15 +72,20 @@ COLORS = {
     "log_request": "#FBBC04",
 }
 
+# 尺寸字典：键为下拉显示文案，值为云雾 gpt-image-2 文档支持的 size 取值。
+# 文档约束：最长边≤3840px、宽高均为16的倍数、长短边比≤3:1、总像素 655360~8294400。
+# 详见云雾 apifox「创建 gpt-image-2」接口文档。
 SIZE_MAP = {
-    "1:1  正方形":      {"pixel": "1024x1024", "ratio": "1:1"},
-    "3:2  相机横版":     {"pixel": "1536x1024", "ratio": "3:2"},
-    "2:3  相机竖版":     {"pixel": "1024x1536", "ratio": "2:3"},
-    "4:3  传统横版":     {"pixel": "1280x960",  "ratio": "4:3"},
-    "3:4  传统竖版":     {"pixel": "960x1280",  "ratio": "3:4"},
-    "16:9 宽屏横版":    {"pixel": "1792x1024", "ratio": "16:9"},
-    "9:16 手机竖版":    {"pixel": "1024x1792", "ratio": "9:16"},
+    "自动（由模型决定）":        {"pixel": "auto",      "ratio": "auto"},
+    "1:1  正方形 1024×1024":     {"pixel": "1024x1024", "ratio": "1:1"},
+    "3:2  横版 1536×1024":       {"pixel": "1536x1024", "ratio": "3:2"},
+    "2:3  竖版 1024×1536":       {"pixel": "1024x1536", "ratio": "2:3"},
+    "1:1  2K 正方形 2048×2048":  {"pixel": "2048x2048", "ratio": "1:1"},
+    "16:9 2K 横版 2048×1152":    {"pixel": "2048x1152", "ratio": "16:9"},
+    "16:9 4K 横版 3840×2160":    {"pixel": "3840x2160", "ratio": "16:9"},
+    "9:16 4K 竖版 2160×3840":    {"pixel": "2160x3840", "ratio": "9:16"},
 }
+DEFAULT_SIZE_KEY = "1:1  正方形 1024×1024"
 
 CONFIG_FILE = Path.home() / ".gpt_image_gen_config.json"
 DEFAULT_CONFIG = {
@@ -89,12 +93,11 @@ DEFAULT_CONFIG = {
     "api_base": "https://yunwu.ai/v1",
     "save_dir": str(Path.home() / "Pictures"),
     "filename_prefix": "ai_image",
-    "last_size_key": "1:1  正方形",
+    "last_size_key": DEFAULT_SIZE_KEY,
     # 用户保存的模型列表（云雾 API 内的模型 ID），下拉框从此读取
     "models": ["gpt-image-2"],
     "model": "gpt-image-2",
     "quality": "auto",
-    "single_count": 1,
 }
 
 
@@ -599,28 +602,6 @@ class ImageGeneratorApp:
 
         self._refresh_saved_models()
 
-        # 画质（gpt-image-2 档位）
-        card_quality = self._mk_card(page)
-        card_quality.pack(fill="x", pady=(0, 12), padx=2)
-        self._mk_label(card_quality, "🎚️  默认画质", size=15, weight="bold").pack(
-            anchor="w", padx=20, pady=(18, 4))
-        self._mk_label(card_quality,
-                       "gpt-image-2 画质档位，默认 auto；单次/批量页也可临时切换。",
-                       size=11, color=COLORS["text_secondary"]).pack(
-            anchor="w", padx=20, pady=(0, 10))
-        qr = ctk.CTkFrame(card_quality, fg_color="transparent")
-        qr.pack(fill="x", padx=20, pady=(0, 18))
-        self._mk_label(qr, "画质", size=12,
-                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 10))
-        self.combo_quality = self._mk_optionmenu(
-            qr, QUALITY_OPTIONS, width=120, height=36,
-            command=self._on_quality_changed)
-        self.combo_quality.pack(side="left")
-        cur_q = self.config.get("quality", "auto")
-        self.combo_quality.set(cur_q if cur_q in QUALITY_OPTIONS else "auto")
-        self._mk_label(qr, "（auto 由模型自动决定；high 更慢更贵）", size=10,
-                       color=COLORS["text_secondary"]).pack(side="left", padx=(10, 0))
-
         # 默认路径
         card2 = self._mk_card(page)
         card2.pack(fill="x", pady=(0, 12), padx=2)
@@ -710,8 +691,8 @@ class ImageGeneratorApp:
             r1, list(SIZE_MAP.keys()), width=170,
             command=self._on_single_size_changed)
         self.combo_single_size.pack(side="left")
-        lk = self.config.get("last_size_key", "1:1  正方形")
-        self.combo_single_size.set(lk if lk in SIZE_MAP else "1:1  正方形")
+        lk = self.config.get("last_size_key", DEFAULT_SIZE_KEY)
+        self.combo_single_size.set(lk if lk in SIZE_MAP else DEFAULT_SIZE_KEY)
         self.lbl_single_pixel = self._mk_label(
             r1, self._size_caption(self.combo_single_size.get(), self.combo_single_model.get()),
             size=11, color=COLORS["text_secondary"])
@@ -729,17 +710,18 @@ class ImageGeneratorApp:
         self._mk_label(r2, ".png（自动追加时间戳）", size=10,
                        color=COLORS["text_secondary"]).pack(side="left", padx=(8, 0))
 
-        # 出图张数（单条提示词，一次可出多张）
-        rc = ctk.CTkFrame(card_params, fg_color="transparent")
-        rc.pack(fill="x", padx=20, pady=(0, 6))
-        self._mk_label(rc, "出图张数", size=12,
+        # 出图画质（gpt-image-2 quality 档位，单次页可临时切换）
+        rq = ctk.CTkFrame(card_params, fg_color="transparent")
+        rq.pack(fill="x", padx=20, pady=(0, 6))
+        self._mk_label(rq, "出图画质", size=12,
                        color=COLORS["text_secondary"]).pack(side="left", padx=(0, 10))
-        self.combo_single_count = self._mk_optionmenu(
-            rc, [str(i) for i in range(1, SINGLE_MAX + 1)], width=90)
-        self.combo_single_count.pack(side="left")
-        self.combo_single_count.set(str(self.config.get("single_count", 1)))
-        self._mk_label(rc, f"（同一提示词最多 {SINGLE_MAX} 张，多条提示词请用批量出图）",
-                       size=10, color=COLORS["text_secondary"]).pack(side="left", padx=(8, 0))
+        self.combo_single_quality = self._mk_optionmenu(
+            rq, QUALITY_OPTIONS, width=120,
+            command=self._on_single_quality_changed)
+        self.combo_single_quality.pack(side="left")
+        self.combo_single_quality.set(self._quality())
+        self._mk_label(rq, "（auto 由模型自动决定；high 更慢更贵）", size=10,
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(8, 0))
 
         # 保存路径提示
         r3 = ctk.CTkFrame(card_params, fg_color="transparent")
@@ -839,12 +821,25 @@ class ImageGeneratorApp:
             r1, list(SIZE_MAP.keys()), width=170,
             command=self._on_batch_size_changed)
         self.combo_batch_size.pack(side="left")
-        lk = self.config.get("last_size_key", "1:1  正方形")
-        self.combo_batch_size.set(lk if lk in SIZE_MAP else "1:1  正方形")
+        lk = self.config.get("last_size_key", DEFAULT_SIZE_KEY)
+        self.combo_batch_size.set(lk if lk in SIZE_MAP else DEFAULT_SIZE_KEY)
         self.lbl_batch_pixel = self._mk_label(
             r1, self._size_caption(self.combo_batch_size.get(), self.combo_batch_model.get()),
             size=11, color=COLORS["text_secondary"])
         self.lbl_batch_pixel.pack(side="left", padx=(10, 0))
+
+        # 出图画质（gpt-image-2 quality 档位，批量页可临时切换）
+        rq = ctk.CTkFrame(card_params, fg_color="transparent")
+        rq.pack(fill="x", padx=20, pady=(0, 6))
+        self._mk_label(rq, "出图画质", size=12,
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(0, 10))
+        self.combo_batch_quality = self._mk_optionmenu(
+            rq, QUALITY_OPTIONS, width=120,
+            command=self._on_batch_quality_changed)
+        self.combo_batch_quality.pack(side="left")
+        self.combo_batch_quality.set(self._quality())
+        self._mk_label(rq, "（auto 由模型自动决定；high 更慢更贵）", size=10,
+                       color=COLORS["text_secondary"]).pack(side="left", padx=(8, 0))
 
         # 文件名
         r2 = ctk.CTkFrame(card_params, fg_color="transparent")
@@ -1224,7 +1219,6 @@ class ImageGeneratorApp:
         self.config["api_key"] = self.entry_key.get().strip()
         self.config["api_base"] = self.entry_base.get().strip()
         self.config["save_dir"] = self.entry_save_dir.get().strip()
-        self.config["quality"] = self.combo_quality.get()
         save_config(self.config)
         self._check_api_status()
         self._refresh_save_dir_labels()
@@ -1250,7 +1244,8 @@ class ImageGeneratorApp:
 
     def _size_caption(self, size_key, model_name=None):
         info = SIZE_MAP.get(size_key, {"pixel": "1024x1024", "ratio": "1:1"})
-        return f"({info['pixel']})"
+        px = info["pixel"]
+        return "(由模型自动决定)" if px == "auto" else f"({px})"
 
     # ================================================================
     #  模型管理（查询 / 手动 / 多保存）
@@ -1373,38 +1368,90 @@ class ImageGeneratorApp:
         self.log_error(f"查询模型失败: {msg[:120]}")
 
     def _show_model_picker(self, ids):
-        """弹窗列出查询到的模型，勾选后加入已保存列表。"""
+        """弹窗列出查询到的模型，支持模糊搜索过滤 + 多选勾选，确认后批量加入。"""
         win = ctk.CTkToplevel(self.win)
         win.title("选择要添加的模型")
-        win.geometry("420x520")
+        win.geometry("460x600")
         win.configure(fg_color=COLORS["bg"])
         win.transient(self.win)
         win.grab_set()
 
+        existing = set(self.config.get("models") or [])
+        # 勾选状态用字典持久保存（跨过滤刷新不丢失），key=模型ID
+        checked = {mid: False for mid in ids}
+
         self._mk_label(win, f"云雾 API 可用模型（{len(ids)} 个）", size=14,
                        weight="bold").pack(anchor="w", padx=20, pady=(16, 4))
-        self._mk_label(win, "勾选需要的模型，点底部「添加所选」", size=11,
-                       color=COLORS["text_secondary"]).pack(anchor="w", padx=20, pady=(0, 8))
+        self._mk_label(win, "输入关键词模糊筛选，勾选后点底部「添加所选」（支持多选）",
+                       size=11, color=COLORS["text_secondary"]).pack(
+            anchor="w", padx=20, pady=(0, 8))
+
+        # 搜索框 + 全选/清空
+        search_row = ctk.CTkFrame(win, fg_color="transparent")
+        search_row.pack(fill="x", padx=20, pady=(0, 6))
+        entry_search = self._mk_entry(search_row)
+        entry_search.configure(placeholder_text="🔍 输入关键词过滤，如 gpt / image / dall")
+        entry_search.pack(side="left", fill="x", expand=True)
 
         scroll = ctk.CTkScrollableFrame(win, fg_color=COLORS["surface"], corner_radius=8)
-        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        scroll.pack(fill="both", expand=True, padx=20, pady=(6, 6))
 
-        existing = set(self.config.get("models") or [])
-        vars_map = {}
-        for mid in ids:
-            v = ctk.BooleanVar(value=False)
-            vars_map[mid] = v
-            label = f"  {mid}" + ("  (已保存)" if mid in existing else "")
-            ctk.CTkCheckBox(
-                scroll, text=label, variable=v,
-                checkbox_width=18, checkbox_height=18, corner_radius=5,
-                fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
-                border_color=COLORS["divider"], border_width=2,
-                text_color=COLORS["text_primary"],
-                font=("Microsoft YaHei UI", 12)).pack(anchor="w", padx=12, pady=4)
+        lbl_count = self._mk_label(win, "", size=11, color=COLORS["accent"])
+        lbl_count.pack(anchor="w", padx=20, pady=(0, 4))
+
+        def render(keyword=""):
+            for w in scroll.winfo_children():
+                w.destroy()
+            kw = keyword.strip().lower()
+            shown = [m for m in ids if kw in m.lower()] if kw else list(ids)
+            if not shown:
+                self._mk_label(scroll, "（无匹配模型）", size=12,
+                               color=COLORS["text_secondary"]).pack(
+                    anchor="w", padx=12, pady=10)
+            for mid in shown:
+                v = ctk.BooleanVar(value=checked[mid])
+
+                def _on_toggle(name=mid, var=v):
+                    checked[name] = var.get()
+                    _update_count()
+
+                label = f"  {mid}" + ("  (已保存)" if mid in existing else "")
+                ctk.CTkCheckBox(
+                    scroll, text=label, variable=v, command=_on_toggle,
+                    checkbox_width=18, checkbox_height=18, corner_radius=5,
+                    fg_color=COLORS["accent"], hover_color=COLORS["accent_hover"],
+                    border_color=COLORS["divider"], border_width=2,
+                    text_color=COLORS["text_primary"],
+                    font=("Microsoft YaHei UI", 12)).pack(anchor="w", padx=12, pady=4)
+
+        def _update_count():
+            n = sum(1 for ok in checked.values() if ok)
+            lbl_count.configure(text=f"已勾选 {n} 个")
+
+        def _select_all_visible():
+            kw = entry_search.get().strip().lower()
+            shown = [m for m in ids if kw in m.lower()] if kw else list(ids)
+            for m in shown:
+                checked[m] = True
+            render(entry_search.get())
+            _update_count()
+
+        def _clear_all():
+            for m in checked:
+                checked[m] = False
+            render(entry_search.get())
+            _update_count()
+
+        self._mk_btn(search_row, "全选", "secondary",
+                     command=_select_all_visible).pack(side="left", padx=(8, 0))
+        self._mk_btn(search_row, "清空", "ghost",
+                     command=_clear_all).pack(side="left", padx=(6, 0))
+
+        # 输入即时过滤
+        entry_search.bind("<KeyRelease>", lambda e: render(entry_search.get()))
 
         def do_add():
-            chosen = [m for m, v in vars_map.items() if v.get()]
+            chosen = [m for m, ok in checked.items() if ok]
             added = 0
             for m in chosen:
                 if m not in (self.config.get("models") or []):
@@ -1419,9 +1466,22 @@ class ImageGeneratorApp:
         self._mk_btn(bf, "添加所选", "primary", command=do_add).pack(side="left")
         self._mk_btn(bf, "取消", "secondary", command=win.destroy).pack(side="left", padx=(8, 0))
 
-    def _on_quality_changed(self, choice):
+        render()
+        _update_count()
+
+    def _on_single_quality_changed(self, choice):
+        """单次页画质切换：持久化并同步到批量页。"""
         self.config["quality"] = choice
         save_config(self.config)
+        if hasattr(self, "combo_batch_quality"):
+            self.combo_batch_quality.set(choice)
+
+    def _on_batch_quality_changed(self, choice):
+        """批量页画质切换：持久化并同步到单次页。"""
+        self.config["quality"] = choice
+        save_config(self.config)
+        if hasattr(self, "combo_single_quality"):
+            self.combo_single_quality.set(choice)
 
     # ---- 单次页模型/尺寸 ----
     def _on_single_model_changed(self, choice):
@@ -1580,27 +1640,12 @@ class ImageGeneratorApp:
         prefix = self.entry_single_prefix.get().strip() or "ai_image"
         quality = self._quality()
 
-        # 出图张数（单条提示词，一次可出多张）
-        try:
-            count = int(self.combo_single_count.get())
-        except Exception:
-            count = 1
-        count = max(1, min(count, SINGLE_MAX))
-        self.config["single_count"] = count
-
         self._warn_pasted_urls(self.ctx_single)
         ref_files = self._get_ref_files(self.ctx_single)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        jobs = []
-        if count == 1:
-            jobs.append({"seq": 1, "prompt": prompt,
-                         "filepath": os.path.join(save_dir, f"{prefix}_{ts}.png")})
-        else:
-            for i in range(1, count + 1):
-                fname = f"{prefix}_{ts}_{i:02d}.png"
-                jobs.append({"seq": i, "prompt": prompt,
-                             "filepath": os.path.join(save_dir, fname)})
+        jobs = [{"seq": 1, "prompt": prompt,
+                 "filepath": os.path.join(save_dir, f"{prefix}_{ts}.png")}]
 
         self._persist_gen_config(api_key, api_base, save_dir, prefix, size_key)
 
@@ -1608,7 +1653,7 @@ class ImageGeneratorApp:
             self._toggle_log()
         mode = "图生图" if ref_files else "文生图"
         self.log_info(f"单次开始 | 模型={model_name} | {mode} | 尺寸={size_key} "
-                      f"| 画质={quality} | 张数={count} | 参考图={len(ref_files)}")
+                      f"| 画质={quality} | 参考图={len(ref_files)}")
 
         self._begin_generation(self.ctx_single, "⏳  生成中...",
                                api_base, api_key, size_key, model_name,
