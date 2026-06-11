@@ -46,6 +46,10 @@ config.json
 *.bak
 *.bak.py
 
+# 开发调试脚本（含历史硬编码 Key，不入库）
+test_*.py
+gen_image.py
+
 # 生成的图片输出目录与缓存
 output/
 logs/

@@ -1,10 +1,20 @@
-# 桌面图片生成器依赖
-# Python 3.10+ 推荐
+# 投行部智能图片生成器 依赖
+# Python 3.10+ 推荐（打包使用 3.13.12）
 
+# ===== 核心 UI 与网络 =====
 customtkinter>=5.2.2
 requests>=2.32.0
 pillow>=10.0.0
 
+# ===== 文档解析（智能分析页文件读取） =====
+python-docx>=1.0.0      # .docx
+openpyxl>=3.1.0         # .xlsx
+python-pptx>=0.6.21      # .pptx
+PyPDF2>=3.0.0           # .pdf
+
+# ===== 打包工具 =====
+pyinstaller>=6.0.0
+
 # 以下为标准库，无需安装：
 # tkinter, threading, concurrent.futures, json, os, time,
-# base64, ipaddress, urllib, datetime, pathlib, io
+# base64, ipaddress, urllib, datetime, pathlib, io, webbrowser

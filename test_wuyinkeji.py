@@ -4,8 +4,9 @@
 import requests
 import json
 import sys
+import os
 
-API_KEY = "xBl3F4ewtem7Ci4mgHR75pRqUq"
+API_KEY = os.environ.get("WUYIN_KEJI_API_KEY", "")
 BASE_URL = "https://api.wuyinkeji.com/api/async/image_gpt"
 
 HEADERS = {

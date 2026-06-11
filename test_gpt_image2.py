@@ -11,11 +11,12 @@
 import requests
 import json
 import sys
+import os
 from datetime import datetime
 
 # ===== 配置 =====
 BASE_URL = "https://yunwu.ai/v1"
-API_KEY = "sk-eKMqTsEJ40rJg4HAEkPVlK1dKXwAx7X5Ewn9sVHtwzcKYt7m"
+API_KEY = os.environ.get("YUNWU_API_KEY", "")
 MODEL_ID = "gpt-image-2"
 
 HEADERS = {
