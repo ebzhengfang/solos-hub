@@ -34,7 +34,7 @@ from io import BytesIO
 # 全局配置
 # ============================================================
 APP_NAME = "投行部智能图片生成器"
-APP_VERSION = "v4.3.1"
+APP_VERSION = "v4.4"
 
 # 批量并发上限（云雾 API 支持高并发，最多 30 路同时出图）
 MAX_CONCURRENCY = 30
@@ -69,7 +69,7 @@ CHAT_MODELS = [
     "deepseek-reasoner",
     "claude-3-7-sonnet-20250219",
 ]
-REASONING_HINTS = ("o1", "o3", "reasoner", "r1", "thinking", "qwq")
+REASONING_HINTS = ("o1", "o3", "reasoner", "r1", "thinking", "qwq", "deep-think", "think")
 
 # 上传文件分析：可直接读取为文本的扩展名 + 单文件读取上限
 TEXT_READABLE_EXTS = {
@@ -327,7 +327,9 @@ def openai_chat_stream(openai_base, openai_key, model, messages,
             if not choices:
                 continue
             delta = choices[0].get("delta", {}) or {}
-            rc = delta.get("reasoning_content")
+            # 兼容多种推理字段名：reasoning_content / reasoning / think / thought
+            rc = (delta.get("reasoning_content") or delta.get("reasoning")
+                  or delta.get("think") or delta.get("thought"))
             if rc:
                 full_reason.append(rc)
                 if on_reasoning:
@@ -1388,6 +1390,9 @@ class ImageGeneratorApp:
         self._chat_cur_reason_box = reason_box
         self._chat_cur_content_buf = ""
         self._chat_cur_reason_buf = ""
+        # 追加模式标志：流式输出时用 insert("end", delta) 而非全删全插
+        self._chat_content_appended = 0   # 已追加到 Textbox 的字符数
+        self._chat_reason_appended = 0     # 已追加到 reason_box 的字符数
 
         self.chat_streaming = True
         self.chat_stop = False
@@ -1410,11 +1415,19 @@ class ImageGeneratorApp:
 
             def on_reason(d):
                 self._chat_cur_reason_buf += d
-                self._ui(lambda: self._update_reason_box(self._chat_cur_reason_buf))
+                if stream:
+                    # 流式追加模式：只插入新增的 delta，避免全删全插的闪烁
+                    self._ui(lambda delta=d: self._append_reason_box(delta))
+                else:
+                    self._ui(lambda: self._update_reason_box(self._chat_cur_reason_buf))
 
             def on_content(d):
                 self._chat_cur_content_buf += d
-                self._ui(lambda: self._update_content_lbl(self._chat_cur_content_buf))
+                if stream:
+                    # 流式追加模式：只插入新增的 delta
+                    self._ui(lambda delta=d: self._append_content_lbl(delta))
+                else:
+                    self._ui(lambda: self._update_content_lbl(self._chat_cur_content_buf))
 
             if stream:
                 reason, content = openai_chat_stream(
@@ -1442,6 +1455,7 @@ class ImageGeneratorApp:
             self._ui(self._chat_done)
 
     def _update_content_lbl(self, text):
+        """全量替换文本（非流式 / 错误信息 / 最终刷新时使用）。"""
         if self._chat_cur_content_lbl is not None:
             lbl = self._chat_cur_content_lbl
             # 兼容 CTkLabel 和 CTkTextbox
@@ -1459,19 +1473,71 @@ class ImageGeneratorApp:
                 lbl.configure(text=text)
             self._chat_scroll_bottom()
 
+    def _append_content_lbl(self, delta):
+        """流式追加模式：只插入新增的 delta 文本，避免全删全插的闪烁。"""
+        if self._chat_cur_content_lbl is not None:
+            lbl = self._chat_cur_content_lbl
+            if hasattr(lbl, '_text'):
+                # CTkTextbox — 追加 delta
+                lbl.configure(state="normal")
+                lbl.insert("end", delta)
+                lbl.configure(state="disabled")
+                lbl._text = (lbl._text or "") + delta
+                self._chat_content_appended += len(delta)
+                # 每 8 次追加或文本较短时调整高度（避免频繁重排）
+                if self._chat_content_appended % 8 < len(delta) or len(lbl._text) < 200:
+                    self._adjust_textbox_height(lbl, lbl._text)
+            else:
+                # CTkLabel — 退回全量替换
+                lbl.configure(text=(lbl.cget("text") or "") + delta)
+            self._chat_scroll_bottom()
+            # 强制刷新 UI，确保用户看到逐字效果
+            try:
+                self.win.update_idletasks()
+            except Exception:
+                pass
+
     def _update_reason_box(self, text):
+        """全量替换推理文本（非流式时使用）。"""
         box = self._chat_cur_reason_box
         if box is not None:
             box.configure(state="normal")
             box.delete("1.0", "end")
             box.insert("1.0", text)
             box.configure(state="disabled")
+            # 推理文本较长时自适应高度
+            self._adjust_textbox_height(box, text)
             self._chat_scroll_bottom()
+
+    def _append_reason_box(self, delta):
+        """流式追加推理文本 delta，避免全删全插。"""
+        box = self._chat_cur_reason_box
+        if box is not None:
+            box.configure(state="normal")
+            box.insert("end", delta)
+            box.configure(state="disabled")
+            self._chat_reason_appended += len(delta)
+            # 每 12 次追加或文本较短时调整高度
+            if self._chat_reason_appended % 12 < len(delta) or self._chat_reason_appended < 200:
+                full = self._chat_cur_reason_buf
+                self._adjust_textbox_height(box, full)
+            self._chat_scroll_bottom()
+            try:
+                self.win.update_idletasks()
+            except Exception:
+                pass
 
     def _chat_done(self):
         self.chat_streaming = False
         self.btn_chat_send.configure(text="发送", state="normal",
                                      fg_color=COLORS["accent"], text_color="white")
+        # 最终全量刷新：确保高度计算精确 + _text 缓存与显示一致
+        if self._chat_cur_content_lbl is not None and hasattr(self._chat_cur_content_lbl, '_text'):
+            self._adjust_textbox_height(self._chat_cur_content_lbl,
+                                        self._chat_cur_content_lbl._text or "")
+        if self._chat_cur_reason_box is not None and self._chat_cur_reason_buf:
+            self._adjust_textbox_height(self._chat_cur_reason_box,
+                                        self._chat_cur_reason_buf)
         self._chat_cur_content_lbl = None
         self._chat_cur_reason_box = None
 
