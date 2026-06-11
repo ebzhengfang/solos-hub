@@ -295,7 +295,8 @@ def openai_chat_stream(openai_base, openai_key, model, messages,
     base = _normalize_openai_base(openai_base)
     url = f"{base}/chat/completions"
     headers = {"Authorization": f"Bearer {openai_key}",
-               "Content-Type": "application/json"}
+               "Content-Type": "application/json",
+               "Accept": "text/event-stream"}
     payload = {"model": model, "messages": messages,
                "temperature": temperature, "stream": True}
     if max_tokens:
@@ -304,41 +305,86 @@ def openai_chat_stream(openai_base, openai_key, model, messages,
     full_reason, full_content = [], []
     with requests.post(url, json=payload, headers=headers,
                        stream=True, timeout=300) as r:
-        # SSE 流 Content-Type 常无 charset，requests 会按 ISO-8859-1 解码导致中文乱码，
-        # 这里强制 UTF-8 解码。
-        r.encoding = "utf-8"
         if r.status_code >= 400:
+            # 非流式错误：直接读全文
             raise RuntimeError(f"对话请求失败 (HTTP {r.status_code}): {r.text[:300]}")
-        for raw in r.iter_lines(decode_unicode=True):
+        # 逐小块读取 SSE 流，避免 iter_lines 被换行/代理缓冲阻塞
+        sse_buf = ""
+        for raw_bytes in r.iter_content(chunk_size=None):
             if stop_flag and stop_flag():
                 break
-            if not raw:
+            if not raw_bytes:
                 continue
-            line = raw.strip()
-            if line.startswith("data:"):
-                line = line[5:].strip()
-            if line == "[DONE]":
-                break
+            # 强制 UTF-8 解码（SSE 流可能无 charset 声明）
             try:
-                chunk = json.loads(line)
+                text = raw_bytes.decode("utf-8")
             except Exception:
-                continue
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {}) or {}
-            # 兼容多种推理字段名：reasoning_content / reasoning / think / thought
-            rc = (delta.get("reasoning_content") or delta.get("reasoning")
-                  or delta.get("think") or delta.get("thought"))
-            if rc:
-                full_reason.append(rc)
-                if on_reasoning:
-                    on_reasoning(rc)
-            c = delta.get("content")
-            if c:
-                full_content.append(c)
-                if on_content:
-                    on_content(c)
+                text = raw_bytes.decode("utf-8", errors="replace")
+            sse_buf += text
+            # 按 \n\n 分割完整的 SSE 事件（每个事件以空行结尾）
+            while "\n\n" in sse_buf:
+                event_text, sse_buf = sse_buf.split("\n\n", 1)
+                # 解析事件内的每行
+                for line in event_text.split("\n"):
+                    line = line.strip()
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    elif line.startswith(":"):
+                        # SSE 注释行，跳过
+                        continue
+                    else:
+                        continue
+                    if line == "[DONE]":
+                        return "".join(full_reason), "".join(full_content)
+                    try:
+                        chunk = json.loads(line)
+                    except Exception:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {}) or {}
+                    # 兼容多种推理字段名：reasoning_content / reasoning / think / thought
+                    rc = (delta.get("reasoning_content") or delta.get("reasoning")
+                          or delta.get("think") or delta.get("thought"))
+                    if rc:
+                        full_reason.append(rc)
+                        if on_reasoning:
+                            on_reasoning(rc)
+                    c = delta.get("content")
+                    if c:
+                        full_content.append(c)
+                        if on_content:
+                            on_content(c)
+        # 处理缓冲区中可能残留的数据
+        if sse_buf.strip():
+            for line in sse_buf.split("\n"):
+                line = line.strip()
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                else:
+                    continue
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                except Exception:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                rc = (delta.get("reasoning_content") or delta.get("reasoning")
+                      or delta.get("think") or delta.get("thought"))
+                if rc:
+                    full_reason.append(rc)
+                    if on_reasoning:
+                        on_reasoning(rc)
+                c = delta.get("content")
+                if c:
+                    full_content.append(c)
+                    if on_content:
+                        on_content(c)
     return "".join(full_reason), "".join(full_content)
 
 
@@ -1324,10 +1370,17 @@ class ImageGeneratorApp:
         return box
 
     def _chat_scroll_bottom(self):
-        try:
-            self.chat_scroll._parent_canvas.yview_moveto(1.0)
-        except Exception:
-            pass
+        """节流滚动到底部：100ms 内合并多次调用，避免流式追加时频繁滚动卡顿。"""
+        if hasattr(self, '_scroll_bottom_pending') and self._scroll_bottom_pending:
+            return  # 已有待执行的滚动，跳过
+        self._scroll_bottom_pending = True
+        def _do_scroll():
+            self._scroll_bottom_pending = False
+            try:
+                self.chat_scroll._parent_canvas.yview_moveto(1.0)
+            except Exception:
+                pass
+        self.win.after(100, _do_scroll)
 
     def _send_chat(self):
         if self.chat_streaming:
@@ -1484,18 +1537,23 @@ class ImageGeneratorApp:
                 lbl.configure(state="disabled")
                 lbl._text = (lbl._text or "") + delta
                 self._chat_content_appended += len(delta)
-                # 每 8 次追加或文本较短时调整高度（避免频繁重排）
-                if self._chat_content_appended % 8 < len(delta) or len(lbl._text) < 200:
+                # 每 ~200 字符调整一次高度（避免频繁重排卡顿）
+                if self._chat_content_appended % 200 < len(delta):
                     self._adjust_textbox_height(lbl, lbl._text)
             else:
                 # CTkLabel — 退回全量替换
                 lbl.configure(text=(lbl.cget("text") or "") + delta)
             self._chat_scroll_bottom()
-            # 强制刷新 UI，确保用户看到逐字效果
-            try:
-                self.win.update_idletasks()
-            except Exception:
-                pass
+            # 节流刷新 UI：50ms 内合并多次 update_idletasks
+            if not hasattr(self, '_ui_flush_pending') or not self._ui_flush_pending:
+                self._ui_flush_pending = True
+                def _flush():
+                    self._ui_flush_pending = False
+                    try:
+                        self.win.update_idletasks()
+                    except Exception:
+                        pass
+                self.win.after(50, _flush)
 
     def _update_reason_box(self, text):
         """全量替换推理文本（非流式时使用）。"""
@@ -1517,15 +1575,11 @@ class ImageGeneratorApp:
             box.insert("end", delta)
             box.configure(state="disabled")
             self._chat_reason_appended += len(delta)
-            # 每 12 次追加或文本较短时调整高度
-            if self._chat_reason_appended % 12 < len(delta) or self._chat_reason_appended < 200:
+            # 每 ~200 字符调整高度
+            if self._chat_reason_appended % 200 < len(delta):
                 full = self._chat_cur_reason_buf
                 self._adjust_textbox_height(box, full)
             self._chat_scroll_bottom()
-            try:
-                self.win.update_idletasks()
-            except Exception:
-                pass
 
     def _chat_done(self):
         self.chat_streaming = False
