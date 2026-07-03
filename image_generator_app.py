@@ -2938,10 +2938,12 @@ class ImageGeneratorApp:
 
     def _open_file(self, path):
         try:
-            if os.name == "nt":
+            import sys, subprocess
+            if sys.platform == "win32":
                 os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
             else:
-                import subprocess
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
             self.log_error(f"打开失败: {e}")
