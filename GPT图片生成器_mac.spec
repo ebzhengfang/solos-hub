@@ -54,7 +54,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,          # macOS 上通常没有 UPX，设 False 避免警告
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -63,4 +63,12 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+# macOS 专用：生成 .app 包，没有这个只会生成裸可执行文件
+app = BUNDLE(
+    exe,
+    name='GPT图片生成器.app',
+    icon=None,
+    bundle_identifier=None,
 )

@@ -36,12 +36,21 @@ jobs:
       - name: 安装依赖
         run: |
           pip install --upgrade pip
-          pip install customtkinter>=5.2.2 requests>=2.32.0 pillow>=10.0.0
-          pip install python-docx>=1.0.0 openpyxl>=3.1.0 python-pptx>=0.6.21 PyPDF2>=3.0.0
-          pip install pyinstaller>=6.0.0
+          pip install "customtkinter>=5.2.2" "requests>=2.32.0" "pillow>=10.0.0"
+          pip install "python-docx>=1.0.0" "openpyxl>=3.1.0" "python-pptx>=0.6.21" "PyPDF2>=3.0.0"
+          pip install "pyinstaller>=6.0.0"
 
       - name: 打包 .app
         run: python -m PyInstaller --clean --noconfirm "GPT图片生成器_mac.spec"
+
+      - name: 验证产物
+        run: |
+          ls -la dist/
+          if [ ! -d "dist/GPT图片生成器.app" ]; then
+            echo "❌ .app 包未生成，打包失败"
+            exit 1
+          fi
+          echo "✅ .app 包生成成功"
 
       - name: 压缩产物
         run: |
