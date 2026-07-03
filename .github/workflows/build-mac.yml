@@ -1,0 +1,56 @@
+# ============================================================
+# macOS 云端打包 — 推送代码后自动在 GitHub 的 macOS 服务器上打包
+#
+# 触发方式：
+#   1. 手动触发：GitHub 仓库 → Actions → "打包 macOS 版" → Run workflow
+#   2. 推送 main 分支时自动触发
+#
+# 产物下载：
+#   Actions 运行完成后 → 页面底部 Artifacts → 下载 mac-app.zip
+#   解压后得到 GPT图片生成器.app，拖入「应用程序」文件夹即可使用
+#
+# 首次打开被 Gatekeeper 拦截：
+#   系统设置 → 隐私与安全性 → 仍要打开
+# ============================================================
+
+name: 打包 macOS 版
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-14
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install customtkinter>=5.2.2 requests>=2.32.0 pillow>=10.0.0
+          pip install python-docx>=1.0.0 openpyxl>=3.1.0 python-pptx>=0.6.21 PyPDF2>=3.0.0
+          pip install pyinstaller>=6.0.0
+
+      - name: 打包 .app
+        run: python -m PyInstaller --clean --noconfirm "GPT图片生成器_mac.spec"
+
+      - name: 压缩产物
+        run: |
+          cd dist
+          zip -r -y ../GPT图片生成器-mac.zip "GPT图片生成器.app"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPT图片生成器-mac
+          path: GPT图片生成器-mac.zip
+          retention-days: 30

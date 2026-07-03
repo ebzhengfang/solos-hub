@@ -25,7 +25,6 @@ import requests
 import json
 import os
 import base64
-import re
 from datetime import datetime
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -2859,49 +2858,20 @@ class ImageGeneratorApp:
 
         self._ui(lambda: self._batch_done(ctx, done["ok"], done["fail"], total))
 
-    @staticmethod
-    def _desensitize_amount(text):
-        """对提示词中的金额数字进行脱敏，替换为 xxx，保留金额单位。
-
-        匹配规则（按优先级）：
-        1. 货币符号 + 数字        → $5000 / ¥1,200 → xxx
-        2. 数字 + 带量纲单位       → 5000万元 / 3.5亿元 / 1200元 → xxx万元 / xxx亿元 / xxx元
-        3. 数字 + 裸单位（万/亿）  → 5000万的业绩 → xxx万的业绩
-        """
-        # 规则1：货币符号 + 数字（含千分位逗号），符号和数字一起替换
-        text = re.sub(r'[$¥€£￥]\s*[\d,]+\.?\d*', 'xxx', text)
-
-        # 规则2：数字 + 带量纲单位，只替换数字，保留单位
-        text = re.sub(
-            r'([\d,]+\.?\d*)\s*(百万元|万元|亿元|千万元|十亿元|万块|亿块|百万块|千元|百元|十元|元|块|角|分|毛)',
-            r'xxx\2', text)
-
-        # 规则3：数字 + 裸单位（千万/万/亿），只替换数字，保留单位
-        text = re.sub(
-            r'([\d,]+\.?\d*)\s*(千万|万千?|亿万?)',
-            r'xxx\2', text)
-
-        return text
-
     def _generate_one(self, api_base, api_key, prompt, size_key, model_name,
                       quality, filepath, ref_files, seq):
         """OpenAI 兼容同步出图：有参考图走图生图(edits)，否则文生图(generations)。"""
-        # ── 金额脱敏 ──
-        safe_prompt = self._desensitize_amount(prompt)
-        if safe_prompt != prompt:
-            self.log_info(f"#{seq} 检测到金额数字，已脱敏处理")
-
         size_info = SIZE_MAP.get(size_key, {"pixel": "1024x1024", "ratio": "1:1"})
         size_pixel = size_info["pixel"]
 
         if ref_files:
             img_data, log_data = openai_edits(
-                api_base, api_key, model_name, safe_prompt, size_pixel,
+                api_base, api_key, model_name, prompt, size_pixel,
                 ref_files, quality=quality, n=1)
             self.log_request("POST", log_data["url"], log_data["payload"])
         else:
             img_data, log_data = openai_generations(
-                api_base, api_key, model_name, safe_prompt, size_pixel,
+                api_base, api_key, model_name, prompt, size_pixel,
                 quality=quality, n=1)
             self.log_request("POST", log_data["url"], log_data["payload"])
 
